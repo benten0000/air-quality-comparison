@@ -14,8 +14,8 @@ class SAITSConfig:
     n_head: int = 4
     dropout: float = 0.1
     d_ffn: int | None = None
-    ORT_weight: float = 1.0
-    MIT_weight: float = 1.0
+    ORT_weight: int = 1
+    MIT_weight: int = 1
 
 
 class SAITSImputer:
@@ -70,6 +70,7 @@ class SAITSImputer:
     ) -> None:
         del min_delta
         self._build_model(epochs=epochs, batch_size=batch_size, patience=patience, lr=initial_lr)
+        assert self.model is not None
         train_set = {"X": dataset["X"]}
         val_set = None
         if validation_data is not None and "X" in validation_data and "X_ori" in validation_data:
