@@ -6,3 +6,12 @@ params:
   n_head: 4
   dropout: 0.1
   bias: true
+  norm_eps: 0.000001
+  qk_norm: true
+  qk_norm_eps: 0.000001
+  train_mask_rate: 0.25
+  train_mask_rate_min: 0.1
+  train_mask_rate_max: 0.9
+  random_target_ratio: true
+  masked_huber_delta: 1.0
+  masked_robust_weight: 1.0

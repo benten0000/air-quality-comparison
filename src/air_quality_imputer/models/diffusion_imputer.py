@@ -40,6 +40,17 @@ class RotaryPositionalEncoding(nn.Module):
         return x_rot
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 _diagonal_mask_cache = {}
 
 
@@ -64,6 +75,8 @@ class SelfAttention(nn.Module):
         self.dropout = config.dropout
         self.head_dim = config.d_model // config.n_head
         self.rotary = RotaryPositionalEncoding(self.head_dim)
+        self.qk_norm = config.qk_norm
+        self.qk_norm_eps = config.qk_norm_eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
@@ -76,6 +89,9 @@ class SelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         q = self.rotary(q)
         k = self.rotary(k)
+        if self.qk_norm:
+            q = F.normalize(q, dim=-1, eps=self.qk_norm_eps)
+            k = F.normalize(k, dim=-1, eps=self.qk_norm_eps)
 
         mask = get_diagonal_mask(T, x.device)
         y = F.scaled_dot_product_attention(
@@ -95,13 +111,14 @@ class MLP(nn.Module):
         super().__init__()
         hidden_dim = 4 * config.d_model
         self.c_fc = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
-        self.act = nn.GELU()
+        self.c_gate = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
         self.c_proj = nn.Linear(hidden_dim, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.c_fc(x)
-        x = self.act(x)
+        x_val = self.c_fc(x)
+        x_gate = F.silu(self.c_gate(x))
+        x = x_val * x_gate
         x = self.c_proj(x)
         return self.dropout(x)
 
@@ -109,9 +126,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_1 = RMSNorm(config.d_model, eps=config.norm_eps)
         self.attn = SelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_2 = RMSNorm(config.d_model, eps=config.norm_eps)
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -130,6 +147,9 @@ class DiffusionTransformerConfig:
     n_head: int = 4
     dropout: float = 0.1
     bias: bool = True
+    norm_eps: float = 1e-6
+    qk_norm: bool = True
+    qk_norm_eps: float = 1e-6
     diffusion_steps: int = 100
     beta_start: float = 1e-4
     beta_end: float = 2e-2
@@ -141,6 +161,9 @@ class DiffusionTransformerConfig:
     deterministic_sampling: bool = True
     inference_nsample: int = 20
     inference_aggregate: Literal["median", "mean"] = "median"
+    observed_loss_weight: float = 1.0
+    masked_huber_delta: float = 1.0
+    masked_robust_weight: float = 1.0
 
 
 class DiffusionTransformerImputer(nn.Module):
@@ -153,7 +176,7 @@ class DiffusionTransformerImputer(nn.Module):
         self.combined_proj = nn.Linear(config.d_model, config.d_model)
 
         self.transformer = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
 
         self.time_mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
@@ -317,7 +340,21 @@ class DiffusionTransformerImputer(nn.Module):
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     pred_eps = self.forward(x_input, input_mask, t)
-                    loss = F.mse_loss(pred_eps[mit_mask], eps[mit_mask])
+                    masked_pred = pred_eps[mit_mask]
+                    masked_target = eps[mit_mask]
+                    mit_mae = torch.abs(masked_pred - masked_target).mean()
+                    mit_huber = F.huber_loss(masked_pred, masked_target, delta=self.config.masked_huber_delta)
+                    mit_loss = mit_mae + self.config.masked_robust_weight * mit_huber
+                    observed_mask = original_mask.bool() & ~mit_mask
+                    if observed_mask.any() and self.config.observed_loss_weight > 0.0:
+                        obs_pred = pred_eps[observed_mask]
+                        obs_target = torch.zeros_like(obs_pred)
+                        obs_mae = torch.abs(obs_pred - obs_target).mean()
+                        obs_huber = F.huber_loss(obs_pred, obs_target, delta=self.config.masked_huber_delta)
+                        obs_loss = obs_mae + self.config.masked_robust_weight * obs_huber
+                    else:
+                        obs_loss = torch.tensor(0.0, device=device)
+                    loss = mit_loss + self.config.observed_loss_weight * obs_loss
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)

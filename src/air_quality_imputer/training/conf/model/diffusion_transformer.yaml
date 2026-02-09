@@ -6,7 +6,10 @@ params:
   n_head: 4
   dropout: 0.1
   bias: true
-  diffusion_steps: 50
+  norm_eps: 0.000001
+  qk_norm: true
+  qk_norm_eps: 0.000001
+  diffusion_steps: 10
   beta_schedule: cosine
   beta_start: 0.0001
   beta_end: 0.02
@@ -15,5 +18,8 @@ params:
   train_mask_rate_max: 0.9
   random_target_ratio: true
   deterministic_sampling: true
-  inference_nsample: 20
+  inference_nsample: 5
   inference_aggregate: median
+  observed_loss_weight: 1.0
+  masked_huber_delta: 1.0
+  masked_robust_weight: 1.0

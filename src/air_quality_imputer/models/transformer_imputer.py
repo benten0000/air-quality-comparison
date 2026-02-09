@@ -33,6 +33,17 @@ class RotaryPositionalEncoding(nn.Module):
         return x_rot
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 _diagonal_mask_cache = {}
 
 
@@ -57,6 +68,8 @@ class SelfAttention(nn.Module):
         self.dropout = config.dropout
         self.head_dim = config.d_model // config.n_head
         self.rotary = RotaryPositionalEncoding(config.d_model)
+        self.qk_norm = config.qk_norm
+        self.qk_norm_eps = config.qk_norm_eps
 
     def forward(self, x):
         B, T, C = x.size()
@@ -69,6 +82,9 @@ class SelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = F.normalize(q, dim=-1, eps=self.qk_norm_eps)
+            k = F.normalize(k, dim=-1, eps=self.qk_norm_eps)
 
         mask = get_diagonal_mask(T, x.device)
         y = F.scaled_dot_product_attention(
@@ -89,24 +105,24 @@ class MLP(nn.Module):
         super().__init__()
         hidden_dim = 4 * config.d_model
         self.c_fc = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
-        self.act = nn.GELU()
+        self.c_gate = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
         self.c_proj = nn.Linear(hidden_dim, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.act(x)
+        x_val = self.c_fc(x)
+        x_gate = F.silu(self.c_gate(x))
+        x = x_val * x_gate
         x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.dropout(x)
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_1 = RMSNorm(config.d_model, eps=config.norm_eps)
         self.attn = SelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_2 = RMSNorm(config.d_model, eps=config.norm_eps)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -125,6 +141,15 @@ class TransformerConfig:
     n_head: int = 4
     dropout: float = 0.1
     bias: bool = True
+    norm_eps: float = 1e-6
+    qk_norm: bool = True
+    qk_norm_eps: float = 1e-6
+    train_mask_rate: float = 0.25
+    train_mask_rate_min: float = 0.10
+    train_mask_rate_max: float = 0.90
+    random_target_ratio: bool = True
+    masked_huber_delta: float = 1.0
+    masked_robust_weight: float = 1.0
 
 
 class TransformerImputer(nn.Module):
@@ -135,7 +160,7 @@ class TransformerImputer(nn.Module):
         self.mask_proj = nn.Linear(config.n_features, config.d_model, bias=config.bias)
         self.combined_proj = nn.Linear(config.d_model, config.d_model)
         self.transformer = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
         self.output_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(config.d_model, config.d_model // 2),
@@ -218,7 +243,16 @@ class TransformerImputer(nn.Module):
             for (batch_x_cpu,) in loader:
                 batch_x = batch_x_cpu.to(device)
                 original_mask = (~torch.isnan(batch_x)).float()
-                mit_mask = (torch.rand_like(batch_x) < 0.25) & original_mask.bool()
+                if self.config.random_target_ratio:
+                    target_rate = float(
+                        torch.empty(1, device=device).uniform_(
+                            self.config.train_mask_rate_min,
+                            self.config.train_mask_rate_max,
+                        )
+                    )
+                else:
+                    target_rate = self.config.train_mask_rate
+                mit_mask = (torch.rand_like(batch_x) < target_rate) & original_mask.bool()
 
                 x_input = batch_x.clone()
                 x_input[mit_mask] = 0.0
@@ -231,11 +265,14 @@ class TransformerImputer(nn.Module):
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     predictions = self.forward(x_input, input_mask)
-                    mit_loss = (
-                        torch.abs(predictions[mit_mask] - target[mit_mask]).mean()
-                        if mit_mask.sum() > 0
-                        else torch.tensor(0.0, device=device)
-                    )
+                    if mit_mask.sum() > 0:
+                        masked_pred = predictions[mit_mask]
+                        masked_target = target[mit_mask]
+                        mit_mae = torch.abs(masked_pred - masked_target).mean()
+                        mit_huber = F.huber_loss(masked_pred, masked_target, delta=self.config.masked_huber_delta)
+                        mit_loss = mit_mae + self.config.masked_robust_weight * mit_huber
+                    else:
+                        mit_loss = torch.tensor(0.0, device=device)
                     observed_mask = original_mask.bool() & ~mit_mask
                     ort_loss = (
                         torch.abs(predictions[observed_mask] - target[observed_mask]).mean()

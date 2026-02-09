@@ -10,7 +10,7 @@ paths:
 
 experiment:
   stations: [E802]
-  models: [diffusion_transformer]
+  models: [classic_transformer, diffusion_transformer]
   features: [PM2.5]
   block_size: 24
   step_size: 1
