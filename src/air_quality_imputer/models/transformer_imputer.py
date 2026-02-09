@@ -156,17 +156,7 @@ class TransformerImputer(nn.Module):
         self.combined_proj = nn.Linear(config.d_model, config.d_model)
         self.transformer = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
-        self.output_heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(config.d_model, config.d_model // 2),
-                    nn.GELU(),
-                    nn.Dropout(config.dropout),
-                    nn.Linear(config.d_model // 2, 1),
-                )
-                for _ in range(config.n_features)
-            ]
-        )
+        self.output_head = nn.Linear(config.d_model, config.n_features)
 
     def forward(self, x, mask):
         x_embedded = self.feature_proj(x)
@@ -176,7 +166,7 @@ class TransformerImputer(nn.Module):
         for block in self.transformer:
             combined = block(combined)
         combined = self.ln_f(combined)
-        return torch.cat([head(combined) for head in self.output_heads], dim=-1)
+        return self.output_head(combined)
 
     def fit(self, dataset, epochs=300, batch_size=128, initial_lr=1e-3, patience=250, min_delta=0.0, validation_data=None):
         device = torch.device("cuda")
