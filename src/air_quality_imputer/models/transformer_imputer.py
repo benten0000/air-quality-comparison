@@ -181,7 +181,7 @@ class TransformerImputer(nn.Module):
     def fit(self, dataset, epochs=300, batch_size=128, initial_lr=1e-3, patience=250, min_delta=0.0, validation_data=None):
         device = torch.device("cuda")
         self.to(device)
-        self = torch.compile(self)
+        compiled_model = cast(nn.Module, torch.compile(self))
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -200,7 +200,7 @@ class TransformerImputer(nn.Module):
         total_epochs = epochs
         eta_min = 1e-7
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            compiled_model.parameters(),
             lr=initial_lr,
             weight_decay=0.01,
             betas=(0.9, 0.999),
@@ -225,9 +225,9 @@ class TransformerImputer(nn.Module):
         use_validation_for_early_stopping = validation_data is not None
         best_loss = float("inf")
         patience_counter = 0
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = torch.cuda.amp.GradScaler()
         for epoch in range(epochs):
-            self.train()
+            compiled_model.train()
             total_loss = 0.0
             num_batches = 0
             for (batch_x,) in loader:
@@ -240,8 +240,8 @@ class TransformerImputer(nn.Module):
                 input_mask[mit_mask] = 0
                 torch.nan_to_num_(x_input, 0)
                 target = torch.nan_to_num(batch_x.clone(), 0)
-                with torch.amp.autocast("cuda"):
-                    predictions = self.forward(x_input, input_mask)
+                with torch.cuda.amp.autocast():
+                    predictions = compiled_model(x_input, input_mask)
                     mit_loss = (
                         torch.abs(predictions[mit_mask] - target[mit_mask]).mean()
                         if mit_mask.sum() > 0
@@ -258,7 +258,7 @@ class TransformerImputer(nn.Module):
                     optimizer.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+                    nn.utils.clip_grad_norm_(compiled_model.parameters(), max_norm=0.5)
                     scaler.step(optimizer)
                     scaler.update()
                     total_loss += loss.item()
@@ -327,7 +327,7 @@ class TransformerImputer(nn.Module):
                 observation_mask = (~missing_mask).float()
                 X_input = torch.nan_to_num(X_tensor, 0)
                 if torch.cuda.is_available():
-                    with torch.amp.autocast("cuda"):
+                    with torch.cuda.amp.autocast():
                         predictions = self.forward(X_input, observation_mask)
                     predictions = predictions.float()
                 else:
