@@ -10,7 +10,7 @@ paths:
 
 experiment:
   stations: [all_stations]
-  models: [classic_transformer, saits]
+  models: [saits]
   features: [PM10,PM2.5,temperature,rain,pressure,precipitation,wind_speed,clouds,wind_direction]
   never_mask_features: []
   block_size: 24
@@ -28,7 +28,7 @@ training:
   epochs: 100
   batch_size: 256
   lr: 0.001
-  patience: 250
+  patience: 99
 
 hydra:
   run:

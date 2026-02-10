@@ -164,7 +164,7 @@ class TransformerImputer(nn.Module):
         self.feature_proj = nn.Linear(config.n_features, config.d_model)
         self.mask_proj = nn.Linear(config.n_features, config.d_model, bias=config.bias)
         self.station_emb = nn.Embedding(max(1, int(config.n_stations)), config.d_model)
-        self.combined_proj = nn.Linear(config.d_model, config.d_model)
+        self.combined_proj = nn.Linear(3 * config.d_model, config.d_model)
         self.transformer = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
         self.output_head = nn.Linear(config.d_model, config.n_features)
@@ -172,16 +172,17 @@ class TransformerImputer(nn.Module):
     def forward(self, x, mask, station_ids: torch.Tensor | None = None):
         x_embedded = self.feature_proj(x)
         mask_embedded = self.mask_proj(mask)
-        combined = x_embedded + mask_embedded
         if station_ids is not None:
             station_ids = station_ids.long()
             if station_ids.dim() == 1:
-                station_emb = self.station_emb(station_ids).unsqueeze(1)
+                station_embedded = self.station_emb(station_ids).unsqueeze(1).expand(-1, x.size(1), -1)
             elif station_ids.dim() == 2:
-                station_emb = self.station_emb(station_ids)
+                station_embedded = self.station_emb(station_ids)
             else:
                 raise ValueError(f"station_ids must be 1D or 2D, got shape {tuple(station_ids.shape)}")
-            combined = combined + station_emb
+        else:
+            station_embedded = torch.zeros_like(x_embedded)
+        combined = torch.cat([x_embedded, mask_embedded, station_embedded], dim=-1)
         combined = self.combined_proj(combined)
         for block in self.transformer:
             combined = block(combined)
