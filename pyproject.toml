@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "air-quality-imputer"
 version = "0.1.0"
-description = "Air quality imputation experiments with transformer-based models"
+description = "Air quality forecasting experiments with global and per-station transformer baselines"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,13 +15,15 @@ dependencies = [
   "hydra-core>=1.3",
   "omegaconf>=2.3",
   "torch",
-  "joblib",
-  "pypots",
+  "mlflow>=2.0",
+  "dagshub",
+  "dvc[s3]",
 ]
 
 [project.scripts]
-aqi-train = "air_quality_imputer.training.train_imputer:main"
-aqi-eval = "air_quality_imputer.training.evaluate_imputer:main"
+aqi-run-experiments = "air_quality_imputer.training.forecast_runner:main"
+aqi-train = "air_quality_imputer.training.forecast_runner:main"
+aqi-eval = "air_quality_imputer.training.forecast_runner:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,163 @@
+schema: '2.0'
+stages:
+  forecast_experiments:
+    cmd: PYTHONPATH=src python -m 
+      air_quality_imputer.pipeline.run_forecast_experiments --params 
+      configs/pipeline/params.yaml
+    deps:
+    - path: configs/pipeline/params.yaml
+      hash: md5
+      md5: a9bc0286c686ac8d51b0bc664990937e
+      size: 2927
+    - path: data/raw
+      hash: md5
+      md5: 2e63b05f91bd8adf716e3332c0d18150.dir
+      size: 39174879
+      nfiles: 22
+    - path: src/air_quality_imputer/models
+      hash: md5
+      md5: 9c8501f546e9eafeaed4dd3f3cee84b5.dir
+      size: 17598
+      nfiles: 4
+    - path: src/air_quality_imputer/pipeline/run_forecast_experiments.py
+      hash: md5
+      md5: 1f693d61b60ed7e815a9bbd35e02be1d
+      size: 465
+    - path: src/air_quality_imputer/training/forecast_experiments.py
+      hash: md5
+      md5: cbb37a046d02b89caf84c7c52a0d4346
+      size: 442
+    params:
+      configs/pipeline/params.yaml:
+        data:
+          data_dir: data/raw
+          station_glob: E403.csv
+          station_geo_path:
+          datetime_col: datetime
+          features:
+          - station
+          - PM10
+          - PM2.5
+          - temperature
+          - rain
+          - pressure
+          - precipitation
+          - wind_speed
+          - clouds
+          - wind_direction
+          never_mask_features:
+          - station
+          target_features:
+          - PM10
+          - PM2.5
+          - temperature
+          - rain
+          - pressure
+          - precipitation
+          - wind_speed
+          - clouds
+          - wind_direction
+        experiment:
+          history_length: 24
+          forecast_horizon: 1
+          step_size: 1
+          train_months: 12
+          reduced_months: 6
+          run_standard: true
+          run_five_fold: false
+          models:
+          - transformer
+          scopes:
+          - global
+          n_folds: 5
+          run_five_fold_if_global_not_worse: true
+          gate_model: transformer
+          gate_metric: mae
+          gate_tolerance_pct: 2.0
+          val_ratio: 0.1
+        metrics:
+          mape_eps: 1e-06
+          mape_min_abs_target: 1.0
+        models:
+          shared:
+            train_mask_mode: random
+            train_missing_rate: 0.2
+            bias: true
+            use_torch_compile: true
+            compile_mode: reduce-overhead
+            compile_dynamic: false
+            optimizer_fused: true
+            optimizer_weight_decay: 0.01
+            scheduler_warmup_ratio: 0.125
+            scheduler_warmup_start_factor: 0.3
+            scheduler_min_lr: 1e-07
+            grad_clip_norm: 0.5
+            dataloader_num_workers: -1
+            dataloader_prefetch_factor: 4
+            dataloader_persistent_workers: true
+            dataloader_pin_memory: true
+          transformer:
+            type: transformer
+            params:
+              d_model: 128
+              n_layer: 3
+              n_head: 4
+              d_ffn:
+              ff_multiplier: 4
+              d_k:
+              d_v:
+              diagonal_attention_mask: true
+              dropout: 0.1
+              norm_eps: 1e-06
+          lstm:
+            type: lstm
+            params:
+              hidden_size: 96
+              num_layers: 2
+              dropout: 0.1
+          gru:
+            type: gru
+            params:
+              hidden_size: 96
+              num_layers: 2
+              dropout: 0.1
+          hybrid_loclstm:
+            type: hybrid_loclstm
+            params:
+              hidden_size: 96
+              num_layers: 2
+              dropout: 0.1
+              embed_dim: 16
+              geo_dim: 2
+              station_feature_index: 0
+        output:
+          save_models: false
+        paths:
+          reports_dir: reports/forecast_experiments
+          models_dir: artifacts/models/forecast_experiments
+          metrics_path: reports/metrics/forecast_metrics.json
+        seed: 42
+        training:
+          device: auto
+          epochs: 1
+          batch_size: 128
+          lr: 0.0008
+          early_stopping: true
+          patience: 20
+          min_delta: 0.0001
+          log_every: 5
+    outs:
+    - path: artifacts/models/forecast_experiments
+      hash: md5
+      md5: d751713988987e9331980363e24189ce.dir
+      size: 0
+      nfiles: 0
+    - path: reports/forecast_experiments
+      hash: md5
+      md5: 1f02022301ba6cf4c1136ef42fb7839b.dir
+      size: 3005
+      nfiles: 3
+    - path: reports/metrics/forecast_metrics.json
+      hash: md5
+      md5: 7984a4a43384c920be315f41d4f27c19
+      size: 417

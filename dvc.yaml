@@ -1,0 +1,25 @@
+stages:
+  forecast_experiments:
+    cmd: PYTHONPATH=src python -m air_quality_imputer.pipeline.run_forecast_experiments --params configs/pipeline/params.yaml
+    deps:
+      - src/air_quality_imputer/pipeline/run_forecast_experiments.py
+      - src/air_quality_imputer/training/forecast_runner.py
+      - src/air_quality_imputer/models
+      - configs/pipeline/params.yaml
+      - data/raw
+    params:
+      - configs/pipeline/params.yaml:
+          - seed
+          - data
+          - experiment
+          - metrics
+          - models
+          - training
+          - tracking
+          - paths
+          - output
+    outs:
+      - reports/forecast_experiments
+      - artifacts/models/forecast_experiments
+    metrics:
+      - reports/metrics/forecast_metrics.json

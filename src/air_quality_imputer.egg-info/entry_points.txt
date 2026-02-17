@@ -1,3 +1,0 @@
-[console_scripts]
-aqi-eval = air_quality_imputer.training.evaluate_imputer:main
-aqi-train = air_quality_imputer.training.train_imputer:main

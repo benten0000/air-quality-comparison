@@ -1,9 +1,0 @@
-type: saits
-checkpoint_name: saits.pt
-params:
-  d_model: 128
-  n_layers: 3
-  n_head: 4
-  dropout: 0.1
-  ORT_weight: 1
-  MIT_weight: 1

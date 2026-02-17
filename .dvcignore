@@ -1,0 +1,8 @@
+# Ignore transient files during DVC scans.
+__pycache__/
+*.py[cod]
+*.log
+mlruns/
+logs/
+notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
