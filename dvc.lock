@@ -7,8 +7,8 @@ stages:
     deps:
     - path: configs/pipeline/params.yaml
       hash: md5
-      md5: a9bc0286c686ac8d51b0bc664990937e
-      size: 2927
+      md5: c75b1bc8a067c3cd9a0dfb6554506479
+      size: 3245
     - path: data/raw
       hash: md5
       md5: 2e63b05f91bd8adf716e3332c0d18150.dir
@@ -16,17 +16,17 @@ stages:
       nfiles: 22
     - path: src/air_quality_imputer/models
       hash: md5
-      md5: 9c8501f546e9eafeaed4dd3f3cee84b5.dir
-      size: 17598
-      nfiles: 4
+      md5: 566f1ea81c5dfb87bbd22bfc3bdca120.dir
+      size: 24145
+      nfiles: 5
     - path: src/air_quality_imputer/pipeline/run_forecast_experiments.py
       hash: md5
-      md5: 1f693d61b60ed7e815a9bbd35e02be1d
-      size: 465
-    - path: src/air_quality_imputer/training/forecast_experiments.py
+      md5: a4f4e30971e391d7b2d21ffe61dcdc4b
+      size: 830
+    - path: src/air_quality_imputer/training/forecast_runner.py
       hash: md5
-      md5: cbb37a046d02b89caf84c7c52a0d4346
-      size: 442
+      md5: 0df26246b197d98144baeeded1e44990
+      size: 38665
     params:
       configs/pipeline/params.yaml:
         data:
@@ -67,11 +67,14 @@ stages:
           run_five_fold: false
           models:
           - transformer
+          - lstm
+          - gru
+          - hybrid_loclstm
           scopes:
           - global
           n_folds: 5
-          run_five_fold_if_global_not_worse: true
-          gate_model: transformer
+          run_five_fold_if_global_not_worse: false
+          gate_model: hybrid_loclstm
           gate_metric: mae
           gate_tolerance_pct: 2.0
           val_ratio: 0.1
@@ -100,9 +103,9 @@ stages:
             type: transformer
             params:
               d_model: 128
-              n_layer: 3
-              n_head: 4
-              d_ffn:
+              n_layer: 4
+              n_head: 8
+              d_ffn: 128
               ff_multiplier: 4
               d_k:
               d_v:
@@ -112,20 +115,20 @@ stages:
           lstm:
             type: lstm
             params:
-              hidden_size: 96
-              num_layers: 2
+              hidden_size: 128
+              num_layers: 4
               dropout: 0.1
           gru:
             type: gru
             params:
-              hidden_size: 96
-              num_layers: 2
+              hidden_size: 128
+              num_layers: 4
               dropout: 0.1
           hybrid_loclstm:
             type: hybrid_loclstm
             params:
-              hidden_size: 96
-              num_layers: 2
+              hidden_size: 128
+              num_layers: 4
               dropout: 0.1
               embed_dim: 16
               geo_dim: 2
@@ -137,11 +140,19 @@ stages:
           models_dir: artifacts/models/forecast_experiments
           metrics_path: reports/metrics/forecast_metrics.json
         seed: 42
+        tracking:
+          enabled: true
+          experiment: air-quality-missing-data-imputation
+          experiment_standard: comperosion-normal
+          experiment_five_fold: comperosion-5fold
+          dataset_name: air_quality
+          repo_owner: PetelinekBenjamin
+          repo_name: air-quality-missing-data-imputation
         training:
           device: auto
-          epochs: 1
-          batch_size: 128
-          lr: 0.0008
+          epochs: 100
+          batch_size: 256
+          lr: 0.001
           early_stopping: true
           patience: 20
           min_delta: 0.0001
@@ -154,10 +165,10 @@ stages:
       nfiles: 0
     - path: reports/forecast_experiments
       hash: md5
-      md5: 1f02022301ba6cf4c1136ef42fb7839b.dir
-      size: 3005
+      md5: 1f81f4b951692482e892b415a2241a49.dir
+      size: 4578
       nfiles: 3
     - path: reports/metrics/forecast_metrics.json
       hash: md5
-      md5: 7984a4a43384c920be315f41d4f27c19
-      size: 417
+      md5: 7a4c6e946aa5deeffc6c704658e6047e
+      size: 1587

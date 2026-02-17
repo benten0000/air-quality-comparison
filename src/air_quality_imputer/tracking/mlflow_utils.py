@@ -58,17 +58,29 @@ class MLflowTracker:
                 except Exception as exc:
                     logger.warning("dagshub.init failed: %s", exc)
 
+        self.default_experiment = str(cfg.get("experiment", "air-quality-imputer"))
+
+    def _set_experiment(self, experiment_name: str | None) -> None:
+        if not self.enabled or mlflow is None:
+            return
+        name = (experiment_name or self.default_experiment).strip() or self.default_experiment
         try:
-            mlflow.set_experiment(str(cfg.get("experiment", "air-quality-imputer")))
+            mlflow.set_experiment(name)
         except Exception as exc:
             logger.warning("mlflow.set_experiment failed: %s", exc)
             self.enabled = False
 
     @contextlib.contextmanager
-    def start_run(self, run_name: str, tags: Mapping[str, Any] | None = None) -> Iterator[Any]:
+    def start_run(
+        self,
+        run_name: str,
+        tags: Mapping[str, Any] | None = None,
+        experiment_name: str | None = None,
+    ) -> Iterator[Any]:
         if not self.enabled or mlflow is None:
             yield None
             return
+        self._set_experiment(experiment_name)
         with mlflow.start_run(run_name=run_name) as run:
             mlflow.set_tags({k: str(v) for k, v in {**self.base_tags, **dict(tags or {})}.items() if v is not None})
             yield run

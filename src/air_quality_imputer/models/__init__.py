@@ -6,9 +6,9 @@ from .recurrent_forecasters import (
     LSTMForecaster,
     RecurrentForecasterConfig,
 )
-from .transformer_imputer import (
+from .transformer_forecaster import (
     TransformerConfig,
-    TransformerImputer,
+    TransformerForecaster,
 )
 
 __all__ = [
@@ -19,5 +19,5 @@ __all__ = [
     "LSTMForecaster",
     "RecurrentForecasterConfig",
     "TransformerConfig",
-    "TransformerImputer",
+    "TransformerForecaster",
 ]

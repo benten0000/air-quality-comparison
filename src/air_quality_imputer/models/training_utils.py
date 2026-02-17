@@ -35,50 +35,6 @@ def maybe_compile_model(model: nn.Module, config, device: torch.device) -> nn.Mo
         return model
 
 
-def _clamp01(value: float) -> float:
-    return min(max(value, 0.0), 1.0)
-
-
-def _build_allowed_feature_mask(
-    n_feat: int,
-    device: torch.device,
-    never_mask_indices: list[int] | None,
-) -> torch.Tensor:
-    allowed = torch.ones(n_feat, dtype=torch.bool, device=device)
-    if not never_mask_indices:
-        return allowed
-    idx = torch.as_tensor(never_mask_indices, device=device, dtype=torch.long)
-    idx = idx[(idx >= 0) & (idx < n_feat)]
-    if idx.numel() > 0:
-        allowed[idx] = False
-    return allowed
-
-
-def sample_train_mask(
-    observed_mask: torch.Tensor,
-    config,
-    never_mask_indices: list[int] | None = None,
-) -> torch.Tensor:
-    mode = str(config.train_mask_mode).lower()
-    if mode in {"none", "off"}:
-        return torch.zeros_like(observed_mask, dtype=torch.bool)
-    if mode != "random":
-        raise ValueError(f"Unsupported train_mask_mode: {mode}")
-    missing_rate = _clamp01(float(config.train_missing_rate))
-
-    observed = observed_mask.bool()
-    _, _, n_feat = observed.shape
-    allowed_feature_mask = _build_allowed_feature_mask(
-        n_feat=n_feat,
-        device=observed.device,
-        never_mask_indices=never_mask_indices,
-    )
-    if not allowed_feature_mask.any():
-        return torch.zeros_like(observed, dtype=torch.bool)
-    maskable_observed = observed & allowed_feature_mask.view(1, 1, n_feat)
-    return (torch.rand(observed_mask.shape, device=observed_mask.device) < missing_rate) & maskable_observed
-
-
 def build_forecast_dataloader(
     *,
     x_tensor: torch.Tensor,

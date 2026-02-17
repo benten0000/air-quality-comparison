@@ -1,11 +1,16 @@
 # priprava_podatkov_copy
 
-Projekt uporablja en eksperimentalni runner za primerjavo več arhitektur in dveh pristopov napovedi (1-step ahead):
+Projekt uporablja en eksperimentalni runner za primerjavo več arhitektur napovedi (1-step ahead):
 
 - arhitekture: `transformer`, `lstm`, `gru`, `hybrid_loclstm`
-- pristopa: `global_*` (en model za vse postaje) in `per_station_*` (ločen model na postajo)
+- pristop: za vsak vnos v `data.stations` se nauči ločen model (in ločen run)
 
 Opomba: `hybrid_loclstm` uporablja station embedding in opcijski geo vektor (`data.station_geo_path`), ostale arhitekture identiteto postaje obravnavajo kot navadno vhodno značilko (stolpec `station` v `data.features`).
+
+Vire in obseg učenja upravljaš prek `data.data_dir` + `data.stations`:
+- `data.stations: [all_stations]` -> uporabi `data/raw/all_stations.csv` (vse postaje),
+- `data.stations: [E403]` -> uporabi `data/raw/E403.csv` (ena postaja),
+- `data.stations: [E403, E404, E405, all_stations]` -> za vsak vir zažene svoj trening; če manjka stolpec `station`, se infera iz imena datoteke.
 
 ## Eksperimenti
 
@@ -13,13 +18,13 @@ Runner podpira oba scenarija:
 
 1. `standard`
 - vse postaje imajo poln učni interval,
-- treniranje na prvih `train_months` mesecih,
+- treniranje na prvih `experiment.standard.train_ratio` deležu časovne osi,
 - evalvacija na preostanku podatkov (del > 1 leto).
 
 2. `five_fold`
 - 5-fold delitev po postajah,
 - v vsakem fold-u je 20% postaj označenih kot `reduced` (KFold),
-- za te postaje se pri učenju odstrani prvih `reduced_months` (privzeto 6 mesecev),
+- za te postaje se uporablja manjši train delež `experiment.five_fold.reduced_train_ratio`,
 - evalvacija ostane enaka kot pri `standard`.
 
 ### Natančen protokol (low-data stress-test)
@@ -27,16 +32,14 @@ Runner podpira oba scenarija:
 Ta `five_fold` ni klasični cross-validation z "train na 4, test na 1". Namen je simulacija postaj z manj podatki:
 
 1. V iteraciji `k` izberemo en fold postaj kot `reduced` (~20% postaj).
-2. `reduced` postajam v train obdobju odrežemo prvih `reduced_months` (privzeto 6 mesecev).
+2. `reduced` postajam uporabimo krajši train del glede na `reduced_train_ratio`.
 3. Ostale postaje (~80%) imajo poln train interval.
-4. Za vse vključene arhitekture (`experiment.models`) učimo oba pristopa (`global_*`, `per_station_*`) od začetka v vsaki iteraciji.
+4. Za vse vključene arhitekture (`experiment.common.models`) učimo en model od začetka v vsaki iteraciji.
 5. Evalvacija ostane časovna in enaka kot v `standard` scenariju (preostanek po prvem letu).
-
-Če je vključeno `experiment.run_five_fold_if_global_not_worse=true`, se `five_fold` izvede samo, če je globalni pristop na `standard` scenariju primerljiv ali boljši od per-station glede na izbran `experiment.gate_metric` (npr. `rmse`) in `experiment.gate_tolerance_pct`.
 
 ## Metrike
 
-Za oba pristopa in vse fold-e se računajo:
+Za vse modele in vse fold-e se računajo:
 
 - `MAE`
 - `MAPE` (z nastavljivim floor-om imenovalca prek `metrics.mape_min_abs_target`)
@@ -49,11 +52,12 @@ Za oba pristopa in vse fold-e se računajo:
 
 ## Glavne datoteke
 
-- modeli: `src/air_quality_imputer/models/transformer_imputer.py`, `src/air_quality_imputer/models/recurrent_forecasters.py`
+- modeli: `src/air_quality_imputer/models/transformer_forecaster.py`, `src/air_quality_imputer/models/recurrent_forecasters.py`
 - runner: `src/air_quality_imputer/training/forecast_runner.py`
 - DVC pipeline: `dvc.yaml`
-- parametri (DVC): `configs/pipeline/params.yaml`
-- konfiguracija (Hydra): `conf/forecast.yaml` (naj ostane usklajena z `configs/pipeline/params.yaml`)
+- parametri (single source of truth): `configs/pipeline/params.yaml`
+- v `models.<ime_modela>` ima vsak model svoj `runtime` (optimizer/compile/dataloader) in `params` (arhitektura)
+- modeli ne delajo več implicitnega NaN fill-a; podatki morajo biti brez `NaN/Inf`
 
 ## Zagon
 
@@ -67,7 +71,7 @@ Eksperimenti/override-i prek DVC:
 
 ```bash
 dvc exp run \
-  -S configs/pipeline/params.yaml:experiment.run_five_fold=false \
+  -S configs/pipeline/params.yaml:experiment.five_fold.run=false \
   -S configs/pipeline/params.yaml:training.epochs=2 \
   -S configs/pipeline/params.yaml:output.save_models=false
 
@@ -82,42 +86,30 @@ Metrike za DVC so v `reports/metrics/forecast_metrics.json`.
 Po installu paketa:
 
 ```bash
-aqi-run-experiments
+aqi-run-experiments --params configs/pipeline/params.yaml
 ```
 
-Privzeto zažene samo `standard`. `five_fold` se izvede samo, če nastaviš `experiment.run_five_fold=true`.
+Privzeto zažene samo `standard`. Če želiš tudi `five_fold`, nastavi `experiment.five_fold.run=true`.
 
 Brez installa:
 
 ```bash
-PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner
+PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner --params configs/pipeline/params.yaml
 ```
 
-Primeri override-ov:
+Primer za hiter smoke config (kopija YAML + zagon):
 
 ```bash
-# Samo standard eksperiment
-PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner \
-  experiment.run_five_fold=false
-
-# Hitri smoke run
-PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner \
-  experiment.run_five_fold=false \
-  training.epochs=2 \
-  output.save_models=false
-
-# Celoten protokol na manjšem podnaboru postaj (smoke za standard + five_fold)
-PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner \
-  data.station_glob='E40*.csv' \
-  training.epochs=1 \
-  output.save_models=false
+cp configs/pipeline/params.yaml /tmp/aqi_smoke.yaml
+# nato uredi /tmp/aqi_smoke.yaml (npr. training.epochs=1)
+PYTHONPATH=src python -m air_quality_imputer.training.forecast_runner --params /tmp/aqi_smoke.yaml
 ```
 
 ## Izhodi
 
 Rezultati se shranijo v `reports/forecast_experiments/`:
 
-- `summary_metrics.csv`: skupni rezultati po pristopu/fold-u/scenariju
+- `summary_metrics.csv`: skupni rezultati po modelu/fold-u/scenariju
 - `station_metrics.csv`: metrike po postajah
 - `fold_assignments.csv`: katere postaje so bile `reduced` v posameznem fold-u
-- `resolved_config.yaml`: dejanska konfiguracija z override-i
+- `resolved_config.yaml`: dejanska konfiguracija iz podanega `--params` YAML

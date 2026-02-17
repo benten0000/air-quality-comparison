@@ -13,11 +13,15 @@ from air_quality_imputer.models.training_utils import (
     build_forecast_dataloader,
     configure_cuda_runtime,
     maybe_compile_model,
-    sample_train_mask,
 )
 
 
 class ForecastModelMixin:
+    @staticmethod
+    def _assert_finite(tensor: torch.Tensor, name: str) -> None:
+        if not torch.isfinite(tensor).all().item():
+            raise ValueError(f"{name} contains NaN/Inf; preprocess data before training/inference")
+
     @staticmethod
     def _set_seed(seed: int) -> None:
         random.seed(seed)
@@ -71,7 +75,7 @@ class ForecastModelMixin:
         batch_size: int,
         shuffle: bool,
         amp: bool,
-        shared_cfg: DictConfig,
+        runtime_cfg: DictConfig,
     ):
         return build_forecast_dataloader(
             x_tensor=torch.from_numpy(np.asarray(x, dtype=np.float32)),
@@ -82,10 +86,10 @@ class ForecastModelMixin:
             ),
             batch_size=int(batch_size),
             amp_enabled=amp,
-            num_workers=int(shared_cfg.dataloader_num_workers),
-            prefetch_factor=int(shared_cfg.dataloader_prefetch_factor),
-            persistent_workers=bool(shared_cfg.dataloader_persistent_workers),
-            pin_memory=bool(shared_cfg.dataloader_pin_memory),
+            num_workers=int(runtime_cfg.dataloader_num_workers),
+            prefetch_factor=int(runtime_cfg.dataloader_prefetch_factor),
+            persistent_workers=bool(runtime_cfg.dataloader_persistent_workers),
+            pin_memory=bool(runtime_cfg.dataloader_pin_memory),
             shuffle=shuffle,
         )
 
@@ -104,10 +108,10 @@ class ForecastModelMixin:
                 bx = bx.to(device, non_blocking=amp)
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
-                obs_mask = (~torch.isnan(bx)).float()
-                torch.nan_to_num_(bx, 0.0)
-                pred_all = model(bx, obs_mask, station_ids=sid, station_geo=geo)
-                pred = pred_all[:, -1, :].index_select(1, target_idx_tensor)
+                ForecastModelMixin._assert_finite(bx, "predict.x")
+                input_mask = torch.ones_like(bx)
+                pred_all = model(bx, input_mask, station_ids=sid, station_geo=geo)
+                pred = pred_all.index_select(1, target_idx_tensor)
                 out.append(pred.detach().cpu().numpy())
         if not out:
             return np.empty((0, int(target_idx_tensor.numel())), dtype=np.float32)
@@ -130,10 +134,11 @@ class ForecastModelMixin:
                 by = by.to(device, non_blocking=amp)
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
-                obs_mask = (~torch.isnan(bx)).float()
-                torch.nan_to_num_(bx, 0.0)
-                pred_all = model(bx, obs_mask, station_ids=sid, station_geo=geo)
-                pred = pred_all[:, -1, :].index_select(1, target_idx_tensor)
+                ForecastModelMixin._assert_finite(bx, "eval.x")
+                ForecastModelMixin._assert_finite(by, "eval.y")
+                input_mask = torch.ones_like(bx)
+                pred_all = model(bx, input_mask, station_ids=sid, station_geo=geo)
+                pred = pred_all.index_select(1, target_idx_tensor)
                 total += float(criterion(pred, by).item())
                 n_batches += 1
         return total / max(n_batches, 1)
@@ -147,9 +152,8 @@ class ForecastModelMixin:
         y_val: np.ndarray,
         target_indices: list[int],
         training_cfg: DictConfig,
-        shared_cfg: DictConfig,
+        runtime_cfg: DictConfig,
         seed: int,
-        never_mask_indices: list[int] | None = None,
         train_station_ids: np.ndarray | None = None,
         train_station_geo: np.ndarray | None = None,
         val_station_ids: np.ndarray | None = None,
@@ -163,12 +167,12 @@ class ForecastModelMixin:
         device = self._device_from_cfg(str(training_cfg.device))
         configure_cuda_runtime(device)
         module_self.to(device)
-        active_model = maybe_compile_model(module_self, shared_cfg, device)
+        active_model = maybe_compile_model(module_self, runtime_cfg, device)
         amp = device.type == "cuda"
         scaler = self._grad_scaler(amp)
 
-        use_fused = bool(shared_cfg.optimizer_fused) and amp
-        weight_decay = float(shared_cfg.optimizer_weight_decay)
+        use_fused = bool(runtime_cfg.optimizer_fused) and amp
+        weight_decay = float(runtime_cfg.optimizer_weight_decay)
         try:
             optimizer = torch.optim.AdamW(
                 active_model.parameters(),
@@ -184,20 +188,20 @@ class ForecastModelMixin:
                 fused=False,
             )
 
-        warmup_ratio = min(max(float(shared_cfg.scheduler_warmup_ratio), 0.0), 1.0)
+        warmup_ratio = min(max(float(runtime_cfg.scheduler_warmup_ratio), 0.0), 1.0)
         warmup_epochs = max(1, int(round(int(training_cfg.epochs) * warmup_ratio)))
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[
                 torch.optim.lr_scheduler.LinearLR(
                     optimizer,
-                    start_factor=float(shared_cfg.scheduler_warmup_start_factor),
+                    start_factor=float(runtime_cfg.scheduler_warmup_start_factor),
                     total_iters=warmup_epochs,
                 ),
                 torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
                     T_max=max(1, int(training_cfg.epochs) - warmup_epochs),
-                    eta_min=float(shared_cfg.scheduler_min_lr),
+                    eta_min=float(runtime_cfg.scheduler_min_lr),
                 ),
             ],
             milestones=[warmup_epochs],
@@ -212,7 +216,7 @@ class ForecastModelMixin:
             int(training_cfg.batch_size),
             True,
             amp,
-            shared_cfg,
+            runtime_cfg,
         )
 
         if len(x_val) > 0:
@@ -225,7 +229,7 @@ class ForecastModelMixin:
                 int(training_cfg.batch_size),
                 False,
                 amp,
-                shared_cfg,
+                runtime_cfg,
             )
         else:
             val_loader = None
@@ -246,30 +250,20 @@ class ForecastModelMixin:
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
 
-                original_mask = (~torch.isnan(bx)).float()
-                mit_mask = sample_train_mask(
-                    original_mask.bool(),
-                    shared_cfg,
-                    never_mask_indices=never_mask_indices,
-                )
-                x_in = bx.clone()
-                input_mask = original_mask.clone()
-                if mit_mask.any():
-                    x_in[mit_mask] = 0.0
-                    input_mask[mit_mask] = 0.0
-                torch.nan_to_num_(x_in, 0.0)
-                by = torch.nan_to_num(by, 0.0)
+                self._assert_finite(bx, "train.x")
+                self._assert_finite(by, "train.y")
+                input_mask = torch.ones_like(bx)
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp):
-                    pred_all = active_model(x_in, input_mask, station_ids=sid, station_geo=geo)
-                    pred = pred_all[:, -1, :].index_select(1, target_idx_tensor)
+                    pred_all = active_model(bx, input_mask, station_ids=sid, station_geo=geo)
+                    pred = pred_all.index_select(1, target_idx_tensor)
                     loss = criterion(pred, by)
 
                 if torch.isfinite(loss).item():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(active_model.parameters(), max_norm=float(shared_cfg.grad_clip_norm))
+                    nn.utils.clip_grad_norm_(active_model.parameters(), max_norm=float(runtime_cfg.grad_clip_norm))
                     scaler.step(optimizer)
                     scaler.update()
                     running += float(loss.item())
@@ -311,7 +305,7 @@ class ForecastModelMixin:
         target_indices: list[int],
         batch_size: int,
         device: torch.device,
-        shared_cfg: DictConfig,
+        runtime_cfg: DictConfig,
         station_ids: np.ndarray | None = None,
         station_geo: np.ndarray | None = None,
     ) -> np.ndarray:
@@ -330,7 +324,7 @@ class ForecastModelMixin:
             batch_size,
             False,
             amp,
-            shared_cfg,
+            runtime_cfg,
         )
         target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
         return self._predict_batches(module_self, data_loader, device, target_idx_tensor, amp)

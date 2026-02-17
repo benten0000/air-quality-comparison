@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from omegaconf import DictConfig, OmegaConf
-
-from air_quality_imputer.training.forecast_runner import run, validate_cfg
+from air_quality_imputer.training.forecast_runner import run_from_params
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -21,11 +19,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
-    cfg = OmegaConf.load(Path(args.params))
-    if not isinstance(cfg, DictConfig):
-        raise TypeError(f"Expected DictConfig from {args.params}, got {type(cfg)!r}")
-    validate_cfg(cfg)
-    run(cfg)
+    run_from_params(Path(args.params))
 
 
 if __name__ == "__main__":

@@ -31,7 +31,6 @@ class RecurrentForecasterBase(ForecastModelMixin, nn.Module):
     def __init__(self, config: RecurrentForecasterConfig):
         super().__init__()
         self.config = config
-        self.missing_value = nn.Parameter(torch.zeros(config.n_features, dtype=torch.float32))
         self.rnn = self.rnn_cls(
             input_size=config.n_features,
             hidden_size=config.hidden_size,
@@ -49,11 +48,9 @@ class RecurrentForecasterBase(ForecastModelMixin, nn.Module):
         station_ids: torch.Tensor | None = None,
         station_geo: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del station_ids, station_geo
-        mv = self.missing_value.view(1, 1, -1).to(dtype=x.dtype, device=x.device)
-        x_filled = x * mask + mv * (1.0 - mask)
-        out, _ = self.rnn(x_filled)
-        return self.output_head(out)
+        del mask, station_ids, station_geo
+        out, _ = self.rnn(x)
+        return self.output_head(out[:, -1, :])
 
 
 class LSTMForecaster(RecurrentForecasterBase):
@@ -68,7 +65,6 @@ class HybridLocLSTM(ForecastModelMixin, nn.Module):
     def __init__(self, config: HybridLocLSTMConfig):
         super().__init__()
         self.config = config
-        self.missing_value = nn.Parameter(torch.zeros(config.n_features, dtype=torch.float32))
         self.station_emb = nn.Embedding(config.num_stations, config.embed_dim)
         self.geo_mlp = nn.Sequential(
             nn.Linear(config.geo_dim, 16, bias=True),
@@ -100,31 +96,30 @@ class HybridLocLSTM(ForecastModelMixin, nn.Module):
         station_ids: torch.Tensor | None = None,
         station_geo: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mv = self.missing_value.view(1, 1, -1).to(dtype=x.dtype, device=x.device)
-        x_filled = x * mask + mv * (1.0 - mask)
+        del mask
 
         if self.use_station_feature:
             idx = self.station_feature_index
-            dyn_seq = torch.cat([x_filled[..., :idx], x_filled[..., idx + 1 :]], dim=-1)
+            dyn_seq = torch.cat([x[..., :idx], x[..., idx + 1 :]], dim=-1)
         else:
-            dyn_seq = x_filled
+            dyn_seq = x
 
         if station_ids is None:
             if self.use_station_feature:
                 idx = self.station_feature_index
-                station_ids = torch.round(x_filled[:, -1, idx]).long()
+                station_ids = torch.round(x[:, -1, idx]).long()
             else:
-                station_ids = torch.zeros((x_filled.size(0),), dtype=torch.long, device=x_filled.device)
-        station_ids = station_ids.to(device=x_filled.device, dtype=torch.long)
+                station_ids = torch.zeros((x.size(0),), dtype=torch.long, device=x.device)
+        station_ids = station_ids.to(device=x.device, dtype=torch.long)
         station_ids = torch.clamp(station_ids, min=0, max=int(self.config.num_stations) - 1)
 
         if station_geo is None:
             station_geo = torch.zeros(
-                (x_filled.size(0), int(self.config.geo_dim)),
-                dtype=x_filled.dtype,
-                device=x_filled.device,
+                (x.size(0), int(self.config.geo_dim)),
+                dtype=x.dtype,
+                device=x.device,
             )
-        station_geo = station_geo.to(device=x_filled.device, dtype=x_filled.dtype)
+        station_geo = station_geo.to(device=x.device, dtype=x.dtype)
 
         e_id = self.station_emb(station_ids)
         e_geo = self.geo_mlp(station_geo)
@@ -132,7 +127,7 @@ class HybridLocLSTM(ForecastModelMixin, nn.Module):
         e_seq = e.unsqueeze(1).expand(-1, dyn_seq.size(1), -1)
         seq = torch.cat([dyn_seq, e_seq], dim=-1)
         out, _ = self.lstm(seq)
-        return self.output_head(out)
+        return self.output_head(out[:, -1, :])
 
 
 HybridLocLSTMForecaster = HybridLocLSTM
