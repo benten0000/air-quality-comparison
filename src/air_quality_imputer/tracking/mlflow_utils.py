@@ -49,6 +49,18 @@ class MLflowTracker:
 
         repo_owner = cfg.get("repo_owner")
         repo_name = cfg.get("repo_name")
+        tracking_uri = str(cfg.get("tracking_uri", "")).strip()
+        if not tracking_uri and repo_owner and repo_name:
+            tracking_uri = f"https://dagshub.com/{repo_owner}/{repo_name}.mlflow"
+
+        if tracking_uri:
+            try:
+                mlflow.set_tracking_uri(tracking_uri)
+            except Exception as exc:
+                logger.warning("mlflow.set_tracking_uri failed: %s", exc)
+                self.enabled = False
+                return
+
         if repo_owner and repo_name:
             if dagshub is None:
                 logger.warning("dagshub not installed; skipping dagshub.init")
@@ -66,9 +78,24 @@ class MLflowTracker:
         name = (experiment_name or self.default_experiment).strip() or self.default_experiment
         try:
             mlflow.set_experiment(name)
+            return
         except Exception as exc:
-            logger.warning("mlflow.set_experiment failed: %s", exc)
-            self.enabled = False
+            logger.warning("mlflow.set_experiment failed for '%s': %s", name, exc)
+
+        # Some tracking backends (incl. DagsHub/MLflow) keep deleted experiments
+        # in a recoverable state; restore and retry before disabling tracking.
+        try:
+            client = mlflow.tracking.MlflowClient()
+            exp = client.get_experiment_by_name(name)
+            if exp is not None and str(getattr(exp, "lifecycle_stage", "active")) != "active":
+                client.restore_experiment(exp.experiment_id)
+                mlflow.set_experiment(name)
+                logger.info("Restored deleted MLflow experiment '%s' (id=%s)", name, exp.experiment_id)
+                return
+        except Exception as restore_exc:
+            logger.warning("Failed to restore deleted MLflow experiment '%s': %s", name, restore_exc)
+
+        self.enabled = False
 
     @contextlib.contextmanager
     def start_run(
@@ -81,6 +108,9 @@ class MLflowTracker:
             yield None
             return
         self._set_experiment(experiment_name)
+        if not self.enabled:
+            yield None
+            return
         with mlflow.start_run(run_name=run_name) as run:
             mlflow.set_tags({k: str(v) for k, v in {**self.base_tags, **dict(tags or {})}.items() if v is not None})
             yield run

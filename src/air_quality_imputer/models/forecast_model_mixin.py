@@ -173,38 +173,28 @@ class ForecastModelMixin:
 
         use_fused = bool(runtime_cfg.optimizer_fused) and amp
         weight_decay = float(runtime_cfg.optimizer_weight_decay)
+        lr = float(runtime_cfg.get("optimizer_lr", 1e-3))
         try:
-            optimizer = torch.optim.AdamW(
+            optimizer = torch.optim.Adam(
                 active_model.parameters(),
-                lr=float(training_cfg.lr),
+                lr=lr,
                 weight_decay=weight_decay,
                 fused=use_fused,
             )
         except Exception:
-            optimizer = torch.optim.AdamW(
+            optimizer = torch.optim.Adam(
                 active_model.parameters(),
-                lr=float(training_cfg.lr),
+                lr=lr,
                 weight_decay=weight_decay,
                 fused=False,
             )
 
-        warmup_ratio = min(max(float(runtime_cfg.scheduler_warmup_ratio), 0.0), 1.0)
-        warmup_epochs = max(1, int(round(int(training_cfg.epochs) * warmup_ratio)))
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            schedulers=[
-                torch.optim.lr_scheduler.LinearLR(
-                    optimizer,
-                    start_factor=float(runtime_cfg.scheduler_warmup_start_factor),
-                    total_iters=warmup_epochs,
-                ),
-                torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=max(1, int(training_cfg.epochs) - warmup_epochs),
-                    eta_min=float(runtime_cfg.scheduler_min_lr),
-                ),
-            ],
-            milestones=[warmup_epochs],
+            mode="min",
+            factor=float(runtime_cfg.scheduler_reduce_factor),
+            patience=int(runtime_cfg.scheduler_plateau_patience),
+            min_lr=float(runtime_cfg.scheduler_min_lr),
         )
 
         sid_train, geo_train = self._station_payload(len(x_train), train_station_ids, train_station_geo)
@@ -237,6 +227,7 @@ class ForecastModelMixin:
         criterion = nn.MSELoss()
         target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
         best_metric = float("inf")
+        best_epoch = 0
         patience_counter = 0
         best_state: dict[str, torch.Tensor] | None = None
         start = time.perf_counter()
@@ -275,16 +266,17 @@ class ForecastModelMixin:
                 if val_loader is not None
                 else train_loss
             )
-            scheduler.step()
+            scheduler.step(metric)
 
             if epoch == 1 or epoch % int(training_cfg.log_every) == 0:
                 print(
                     f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | "
-                    f"val_loss={metric:.6f} | lr={scheduler.get_last_lr()[0]:.2e}"
+                    f"val_loss={metric:.6f} | lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
             if metric < best_metric - float(training_cfg.min_delta):
                 best_metric = metric
+                best_epoch = epoch
                 patience_counter = 0
                 best_state = {k: v.detach().cpu().clone() for k, v in module_self.state_dict().items()}
             else:
@@ -296,6 +288,7 @@ class ForecastModelMixin:
 
         if best_state is not None:
             module_self.load_state_dict(best_state)
+            print(f"Restored best model from epoch {best_epoch} | best_val={best_metric:.6f}")
         return time.perf_counter() - start
 
     def predict_forecaster(

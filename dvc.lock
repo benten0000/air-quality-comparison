@@ -7,8 +7,8 @@ stages:
     deps:
     - path: configs/pipeline/params.yaml
       hash: md5
-      md5: c75b1bc8a067c3cd9a0dfb6554506479
-      size: 3245
+      md5: 18cb392efeffc55aeca14a07c4df0f0d
+      size: 4832
     - path: data/raw
       hash: md5
       md5: 2e63b05f91bd8adf716e3332c0d18150.dir
@@ -16,23 +16,24 @@ stages:
       nfiles: 22
     - path: src/air_quality_imputer/models
       hash: md5
-      md5: 566f1ea81c5dfb87bbd22bfc3bdca120.dir
-      size: 24145
+      md5: 6f24fb46a20812cfd2ad61f2e25a19b0.dir
+      size: 26392
       nfiles: 5
     - path: src/air_quality_imputer/pipeline/run_forecast_experiments.py
       hash: md5
-      md5: a4f4e30971e391d7b2d21ffe61dcdc4b
-      size: 830
+      md5: 14d111193a92975aa7558b8e08d9f55d
+      size: 617
     - path: src/air_quality_imputer/training/forecast_runner.py
       hash: md5
-      md5: 0df26246b197d98144baeeded1e44990
-      size: 38665
+      md5: 0687437de09576beab62c8ed1e13efa4
+      size: 36454
     params:
       configs/pipeline/params.yaml:
         data:
           data_dir: data/raw
-          station_glob: E403.csv
-          station_geo_path:
+          stations:
+          - all_stations
+          station_geo_path: configs/pipeline/stations_geo.json
           datetime_col: datetime
           features:
           - station
@@ -45,8 +46,6 @@ stages:
           - wind_speed
           - clouds
           - wind_direction
-          never_mask_features:
-          - station
           target_features:
           - PM10
           - PM2.5
@@ -58,78 +57,120 @@ stages:
           - clouds
           - wind_direction
         experiment:
-          history_length: 24
-          forecast_horizon: 1
-          step_size: 1
-          train_months: 12
-          reduced_months: 6
-          run_standard: true
-          run_five_fold: false
-          models:
-          - transformer
-          - lstm
-          - gru
-          - hybrid_loclstm
-          scopes:
-          - global
-          n_folds: 5
-          run_five_fold_if_global_not_worse: false
-          gate_model: hybrid_loclstm
-          gate_metric: mae
-          gate_tolerance_pct: 2.0
-          val_ratio: 0.1
+          common:
+            history_length: 24
+            forecast_horizon: 1
+            step_size: 1
+            models:
+            - transformer
+            - lstm
+            - gru
+            - hybrid_loclstm
+            val_ratio: 0.1
+          standard:
+            run: true
+            train_ratio: 0.8
+          five_fold:
+            run: false
+            n_folds: 5
+            reduced_train_ratio: 0.4
         metrics:
           mape_eps: 1e-06
           mape_min_abs_target: 1.0
         models:
-          shared:
-            train_mask_mode: random
-            train_missing_rate: 0.2
-            bias: true
-            use_torch_compile: true
-            compile_mode: reduce-overhead
-            compile_dynamic: false
-            optimizer_fused: true
-            optimizer_weight_decay: 0.01
-            scheduler_warmup_ratio: 0.125
-            scheduler_warmup_start_factor: 0.3
-            scheduler_min_lr: 1e-07
-            grad_clip_norm: 0.5
-            dataloader_num_workers: -1
-            dataloader_prefetch_factor: 4
-            dataloader_persistent_workers: true
-            dataloader_pin_memory: true
           transformer:
             type: transformer
+            runtime:
+              bias: true
+              use_torch_compile: true
+              compile_mode: reduce-overhead
+              compile_dynamic: false
+              optimizer_lr: 5e-06
+              optimizer_fused: true
+              optimizer_weight_decay: 0.01
+              scheduler_warmup_ratio: 0.08
+              scheduler_warmup_start_factor: 0.3
+              scheduler_min_lr: 1e-07
+              grad_clip_norm: 1.0
+              dataloader_num_workers: -1
+              dataloader_prefetch_factor: 4
+              dataloader_persistent_workers: true
+              dataloader_pin_memory: true
             params:
               d_model: 128
-              n_layer: 4
-              n_head: 8
-              d_ffn: 128
-              ff_multiplier: 4
+              n_layer: 2
+              n_head: 4
+              d_ffn: 256
               d_k:
               d_v:
-              diagonal_attention_mask: true
-              dropout: 0.1
+              dropout: 0.2
               norm_eps: 1e-06
           lstm:
             type: lstm
+            runtime:
+              bias: true
+              use_torch_compile: true
+              compile_mode: reduce-overhead
+              compile_dynamic: false
+              optimizer_lr: 5e-06
+              optimizer_fused: true
+              optimizer_weight_decay: 0.02
+              scheduler_warmup_ratio: 0.125
+              scheduler_warmup_start_factor: 0.3
+              scheduler_min_lr: 1e-07
+              grad_clip_norm: 1.0
+              dataloader_num_workers: -1
+              dataloader_prefetch_factor: 4
+              dataloader_persistent_workers: true
+              dataloader_pin_memory: true
             params:
               hidden_size: 128
-              num_layers: 4
-              dropout: 0.1
+              num_layers: 2
+              dropout: 0.25
           gru:
             type: gru
+            runtime:
+              bias: true
+              use_torch_compile: true
+              compile_mode: reduce-overhead
+              compile_dynamic: false
+              optimizer_lr: 5e-06
+              optimizer_fused: true
+              optimizer_weight_decay: 0.02
+              scheduler_warmup_ratio: 0.125
+              scheduler_warmup_start_factor: 0.3
+              scheduler_min_lr: 1e-07
+              grad_clip_norm: 0.5
+              dataloader_num_workers: -1
+              dataloader_prefetch_factor: 4
+              dataloader_persistent_workers: true
+              dataloader_pin_memory: true
             params:
               hidden_size: 128
-              num_layers: 4
-              dropout: 0.1
+              num_layers: 2
+              dropout: 0.25
           hybrid_loclstm:
             type: hybrid_loclstm
+            runtime:
+              bias: true
+              use_torch_compile: true
+              compile_mode: reduce-overhead
+              compile_dynamic: false
+              optimizer_lr: 5e-06
+              optimizer_fused: true
+              optimizer_weight_decay: 0.02
+              scheduler_warmup_ratio: 0.125
+              scheduler_warmup_start_factor: 0.3
+              scheduler_min_lr: 1e-07
+              grad_clip_norm: 0.5
+              dataloader_num_workers: -1
+              dataloader_prefetch_factor: 4
+              dataloader_persistent_workers: true
+              dataloader_pin_memory: true
             params:
               hidden_size: 128
-              num_layers: 4
-              dropout: 0.1
+              num_layers: 2
+              dropout: 0.25
               embed_dim: 16
               geo_dim: 2
               station_feature_index: 0
@@ -147,16 +188,17 @@ stages:
           experiment_five_fold: comperosion-5fold
           dataset_name: air_quality
           repo_owner: PetelinekBenjamin
-          repo_name: air-quality-missing-data-imputation
+          repo_name: air-quality-comparison
+          tracking_uri: 
+            https://dagshub.com/PetelinekBenjamin/air-quality-comparison.mlflow
         training:
           device: auto
-          epochs: 100
+          epochs: 80
           batch_size: 256
-          lr: 0.001
           early_stopping: true
           patience: 20
-          min_delta: 0.0001
-          log_every: 5
+          min_delta: 0.0
+          log_every: 1
     outs:
     - path: artifacts/models/forecast_experiments
       hash: md5
@@ -165,10 +207,10 @@ stages:
       nfiles: 0
     - path: reports/forecast_experiments
       hash: md5
-      md5: 1f81f4b951692482e892b415a2241a49.dir
-      size: 4578
+      md5: 9e3fb1f97ec5b3b21aa644e4602e30d5.dir
+      size: 22308
       nfiles: 3
     - path: reports/metrics/forecast_metrics.json
       hash: md5
-      md5: 7a4c6e946aa5deeffc6c704658e6047e
-      size: 1587
+      md5: d11044c91d70c809299bd79b1f31ac99
+      size: 1695

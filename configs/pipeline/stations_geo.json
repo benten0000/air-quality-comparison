@@ -1,0 +1,149 @@
+[
+  {
+    "station": "E403",
+    "lat": 46.0655449,
+    "lon": 14.5127203,
+    "elevation_m": 299.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E404",
+    "lat": 46.037487,
+    "lon": 14.4892717,
+    "elevation_m": 293.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E405",
+    "lat": 46.0720916,
+    "lon": 14.4871183,
+    "elevation_m": 305.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E407",
+    "lat": 46.5588708,
+    "lon": 15.6513026,
+    "elevation_m": 270.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E408",
+    "lat": 46.5683507,
+    "lon": 15.6261221,
+    "elevation_m": 279.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E409",
+    "lat": 46.6520864,
+    "lon": 16.1913166,
+    "elevation_m": 186.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E410",
+    "lat": 46.6577607,
+    "lon": 16.1592329,
+    "elevation_m": 189.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E411",
+    "lat": 46.2345142,
+    "lon": 15.262476,
+    "elevation_m": 240.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E412",
+    "lat": 46.2356572,
+    "lon": 15.2462352,
+    "elevation_m": 240.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E413",
+    "lat": 46.1575084,
+    "lon": 15.0539505,
+    "elevation_m": 284.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E414",
+    "lat": 46.1439131,
+    "lon": 15.0832944,
+    "elevation_m": 290.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E415",
+    "lat": 46.1311142,
+    "lon": 14.9961152,
+    "elevation_m": 241.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E417",
+    "lat": 46.2417883,
+    "lon": 14.3622383,
+    "elevation_m": 388.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E418",
+    "lat": 45.8018182,
+    "lon": 15.1772615,
+    "elevation_m": 220.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E420",
+    "lat": 45.5610998,
+    "lon": 14.8580675,
+    "elevation_m": 540.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E421",
+    "lat": 45.9555691,
+    "lon": 13.6523898,
+    "elevation_m": 113.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E423",
+    "lat": 45.5430119,
+    "lon": 13.7135237,
+    "elevation_m": 56.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E801",
+    "lat": 46.425503,
+    "lon": 15.8765097,
+    "elevation_m": 230.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E802",
+    "lat": 46.4703304,
+    "lon": 14.8501888,
+    "elevation_m": 574.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E803",
+    "lat": 45.5669494,
+    "lon": 15.1879382,
+    "elevation_m": 155.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  },
+  {
+    "station": "E804",
+    "lat": 45.5673216,
+    "lon": 14.2428996,
+    "elevation_m": 400.0,
+    "source": "http://www.arso.gov.si/xml/zrak/ones_zrak_urni_podatki_zadnji.xml"
+  }
+]

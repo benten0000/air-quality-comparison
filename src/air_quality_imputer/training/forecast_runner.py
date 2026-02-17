@@ -30,15 +30,16 @@ ModelKind = Literal["transformer", "lstm", "gru", "hybrid_loclstm"]
 
 SUPPORTED_MODELS: tuple[str, ...] = ("transformer", "lstm", "gru", "hybrid_loclstm")
 RUNTIME_DEFAULTS: dict[str, Any] = {
+    "optimizer_lr": 1e-3,
     "bias": True,
     "use_torch_compile": True,
     "compile_mode": "reduce-overhead",
     "compile_dynamic": False,
     "optimizer_fused": True,
     "optimizer_weight_decay": 0.01,
-    "scheduler_warmup_ratio": 0.125,
-    "scheduler_warmup_start_factor": 0.3,
-    "scheduler_min_lr": 1e-7,
+    "scheduler_reduce_factor": 0.5,
+    "scheduler_plateau_patience": 5,
+    "scheduler_min_lr": 1e-6,
     "grad_clip_norm": 0.5,
     "dataloader_num_workers": -1,
     "dataloader_prefetch_factor": 4,
@@ -661,7 +662,7 @@ def run_scenario(
     station_geo_map = load_station_geo_vectors(cfg, stations)
     print(
         f"[INFO] Training config ({scenario_name}): epochs={int(training_cfg.epochs)}, "
-        f"batch_size={int(training_cfg.batch_size)}, lr={float(training_cfg.lr):.6g}"
+        f"batch_size={int(training_cfg.batch_size)}, lr=model-specific"
     )
     print(f"[INFO] Models: {', '.join(model_kinds)}")
 
@@ -743,7 +744,6 @@ def validate_cfg(cfg: DictConfig) -> None:
         (not bool(cfg.experiment.five_fold.run)) or int(cfg.experiment.five_fold.n_folds) >= 2,
         "n_folds must be >= 2 when five_fold.run=true",
     )
-    req(float(cfg.training.lr) > 0.0, "training.lr must be > 0")
     req(int(cfg.training.epochs) >= 1, "training.epochs must be >= 1")
     req(int(cfg.training.batch_size) >= 1, "training.batch_size must be >= 1")
 

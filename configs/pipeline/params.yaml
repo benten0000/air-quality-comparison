@@ -2,9 +2,31 @@ seed: 42
 
 data:
   data_dir: data/raw
-  stations: [E403, E404, E405, E801, E802, E803, E804, all_stations]
+  stations:
+  # - E403
+  # - E404
+  # - E405
+  # - E407
+  # - E408
+  # - E409
+  # - E410
+  # - E411
+  # - E412
+  # - E413
+  # - E414
+  # - E415
+  # - E417
+  # - E418
+  # - E420
+  # - E421
+  # - E423
+  # - E801
+  # - E802
+  # - E803
+  # - E804
+  - all_stations
   # Optional JSON with station coordinates (for HybridLocLSTM).
-  station_geo_path:
+  station_geo_path: configs/pipeline/stations_geo.json
   datetime_col: datetime
   features:
   - station
@@ -69,16 +91,22 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
+
+      optimizer_lr: 0.000005
       optimizer_fused: true
-      optimizer_weight_decay: 0.02
-      scheduler_warmup_ratio: 0.125
+      optimizer_weight_decay: 0.01
+
+      scheduler_warmup_ratio: 0.08
       scheduler_warmup_start_factor: 0.3
       scheduler_min_lr: 0.0000001
-      grad_clip_norm: 0.5
+
+      grad_clip_norm: 1.0
+
       dataloader_num_workers: -1
       dataloader_prefetch_factor: 4
       dataloader_persistent_workers: true
       dataloader_pin_memory: true
+
     params:
       # Fair baseline: medium-size transformer.
       d_model: 128
@@ -87,8 +115,9 @@ models:
       d_ffn: 256
       d_k:
       d_v:
-      dropout: 0.25
+      dropout: 0.2
       norm_eps: 0.000001
+
 
   lstm:
     type: lstm
@@ -97,12 +126,13 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
+      optimizer_lr: 0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
       scheduler_warmup_start_factor: 0.3
       scheduler_min_lr: 0.0000001
-      grad_clip_norm: 0.5
+      grad_clip_norm: 1.0
       dataloader_num_workers: -1
       dataloader_prefetch_factor: 4
       dataloader_persistent_workers: true
@@ -120,6 +150,7 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
+      optimizer_lr: 0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
@@ -142,6 +173,7 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
+      optimizer_lr: 0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
@@ -162,14 +194,13 @@ models:
 
 training:
   device: auto
-  epochs: 120
+  epochs: 80
   batch_size: 256
-  lr: 0.0008
 
   early_stopping: true
-  patience: 12
+  patience: 20
   min_delta: 0.0
-  log_every: 5
+  log_every: 1
 
 paths:
   reports_dir: reports/forecast_experiments
@@ -186,4 +217,5 @@ tracking:
   experiment_five_fold: comperosion-5fold
   dataset_name: air_quality
   repo_owner: PetelinekBenjamin
-  repo_name: air-quality-missing-data-imputation
+  repo_name: air-quality-comparison
+  tracking_uri: https://dagshub.com/PetelinekBenjamin/air-quality-comparison.mlflow
