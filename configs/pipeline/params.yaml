@@ -3,28 +3,28 @@ seed: 42
 data:
   data_dir: data/raw
   stations:
-  # - E403
-  # - E404
-  # - E405
-  # - E407
-  # - E408
-  # - E409
-  # - E410
-  # - E411
-  # - E412
-  # - E413
-  # - E414
-  # - E415
-  # - E417
-  # - E418
-  # - E420
-  # - E421
-  # - E423
-  # - E801
-  # - E802
-  # - E803
-  # - E804
-  - all_stations
+  - E403
+  - E404
+  - E405
+  - E407
+  - E408
+  - E409
+  - E410
+  - E411
+  - E412
+  - E413
+  - E414
+  - E415
+  - E417
+  - E418
+  - E420
+  - E421
+  - E423
+  - E801
+  - E802
+  - E803
+  - E804
+  #- all_stations
   # Optional JSON with station coordinates (for HybridLocLSTM).
   station_geo_path: configs/pipeline/stations_geo.json
   datetime_col: datetime
@@ -63,19 +63,21 @@ experiment:
     - gru
     - hybrid_loclstm
 
-    # Validation split inside each training slice.
-    val_ratio: 0.1
-
   standard:
     run: true
-    # Share of full timeline used for train; rest is test.
-    train_ratio: 0.8
+    # Share of full timeline used for validation.
+    val_ratio: 0.1
+    # Share of full timeline used for train.
+    train_ratio: 0.7
+    # Share of full timeline used for test.
+    test_ratio: 0.2
 
   five_fold:
-    run: false
+    run: true
     n_folds: 5
-    # Effective train share for reduced stations (must be <= standard.train_ratio).
-    reduced_train_ratio: 0.4
+    # For 20% of stations in each fold, drop the first N months from training
+    # to simulate shorter history availability (mentor spec).
+    missing_months: 6
 
 metrics:
   # MAPE is unstable near zero targets (rain etc.). Keep epsilon for zero-filtering
@@ -92,7 +94,7 @@ models:
       compile_mode: reduce-overhead
       compile_dynamic: false
 
-      optimizer_lr: 0.000005
+      optimizer_lr: 0.0002 #0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.01
 
@@ -126,7 +128,7 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
-      optimizer_lr: 0.000005
+      optimizer_lr: 0.0001 #0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
@@ -150,7 +152,7 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
-      optimizer_lr: 0.000005
+      optimizer_lr: 0.0001 #0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
@@ -173,7 +175,7 @@ models:
       use_torch_compile: true
       compile_mode: reduce-overhead
       compile_dynamic: false
-      optimizer_lr: 0.000005
+      optimizer_lr: 0.0001 #0.000005
       optimizer_fused: true
       optimizer_weight_decay: 0.02
       scheduler_warmup_ratio: 0.125
