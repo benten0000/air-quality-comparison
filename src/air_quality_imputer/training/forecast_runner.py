@@ -605,22 +605,41 @@ def run_approach(
         tracker.log_torch_model(model, artifact_path=model_artifact_path)
 
     station_rows: list[dict[str, float | int | str]] = []
-    all_true, all_pred = [], []
+
+    # Predict all stations in one go to reduce Python/DataLoader overhead and keep GPU utilization high.
+    test_counts: list[int] = []
+    x_test_all = _cat(
+        [splits[st]["x_test"] for st in stations],
+        empty=np.empty((0, history_length, len(features)), dtype=np.float32),
+    )
+    y_test_scaled_all = _cat(
+        [splits[st]["y_test"] for st in stations],
+        empty=np.empty((0, len(target_features)), dtype=np.float32),
+    )
+    sid_test_all, geo_test_all = payload_for(stations, "x_test")
     for st in stations:
-        sp = splits[st]
-        sid_test, geo_test = sid_geo(st, len(sp["x_test"]))
-        pred_scaled = predict_model(
-            model,
-            x=sp["x_test"],
-            target_indices=target_idx,
-            batch_size=int(training_cfg.batch_size),
-            device=dev,
-            runtime_cfg=runtime_cfg,
-            station_ids=sid_test,
-            station_geo=geo_test,
-        )
-        y_true = inverse_scale_targets(sp["y_test"], scalers[st], target_idx)
-        y_pred = inverse_scale_targets(pred_scaled, scalers[st], target_idx)
+        test_counts.append(int(len(splits[st]["x_test"])))
+
+    pred_scaled_all = predict_model(
+        model,
+        x=x_test_all,
+        target_indices=target_idx,
+        batch_size=int(training_cfg.batch_size),
+        device=dev,
+        runtime_cfg=runtime_cfg,
+        station_ids=sid_test_all,
+        station_geo=geo_test_all,
+    )
+
+    # Global approach uses a single scaler for all stations; inverse-scale in one pass.
+    y_true_all = inverse_scale_targets(y_test_scaled_all, scaler, target_idx)
+    y_pred_all = inverse_scale_targets(pred_scaled_all, scaler, target_idx)
+
+    offset = 0
+    for st, n in zip(stations, test_counts):
+        y_true = y_true_all[offset : offset + n]
+        y_pred = y_pred_all[offset : offset + n]
+        offset += n
         station_rows.append(
             {
                 "approach": approach,
@@ -631,8 +650,6 @@ def run_approach(
                 **metrics(y_true, y_pred, mape_eps=mape_eps, mape_min_abs_target=mape_min_abs_target),
             }
         )
-        all_true.append(y_true)
-        all_pred.append(y_pred)
 
     if bool(cfg.output.save_models):
         save_ckpt(
@@ -644,8 +661,8 @@ def run_approach(
             scalers[stations[0]],
         )
 
-    all_true_arr = np.concatenate(all_true, axis=0)
-    all_pred_arr = np.concatenate(all_pred, axis=0)
+    all_true_arr = y_true_all
+    all_pred_arr = y_pred_all
     return (
         {
             "approach": approach,

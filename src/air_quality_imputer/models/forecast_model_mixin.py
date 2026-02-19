@@ -116,6 +116,83 @@ class ForecastModelMixin:
         )
 
     @staticmethod
+    def _as_device_tensors(
+        *,
+        x: np.ndarray,
+        y: np.ndarray,
+        station_ids: np.ndarray,
+        station_geo: np.ndarray,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # One-time H2D transfer keeps the GPU fed; the server GPU has ample VRAM.
+        x_t = torch.from_numpy(np.asarray(x, dtype=np.float32)).to(device, non_blocking=False)
+        y_t = torch.from_numpy(np.asarray(y, dtype=np.float32)).to(device, non_blocking=False)
+        sid_t = torch.from_numpy(np.asarray(station_ids, dtype=np.int64)).to(device, non_blocking=False)
+        geo_t = torch.from_numpy(np.asarray(station_geo, dtype=np.float32)).to(device, non_blocking=False)
+        return x_t, y_t, sid_t, geo_t
+
+    @staticmethod
+    def _eval_loss_tensors(
+        model: nn.Module,
+        *,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sid: torch.Tensor,
+        geo: torch.Tensor,
+        target_idx_tensor: torch.Tensor,
+        batch_size: int,
+        mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor],
+    ) -> float:
+        criterion = nn.MSELoss()
+        total = torch.zeros((), device=x.device, dtype=torch.float32)
+        n_batches = 0
+        model.eval()
+        with torch.no_grad():
+            n = int(x.shape[0])
+            for start in range(0, n, int(batch_size)):
+                end = min(start + int(batch_size), n)
+                bx = x[start:end]
+                by = y[start:end]
+                bsid = sid[start:end]
+                bgeo = geo[start:end]
+                input_mask = ForecastModelMixin._input_mask(bx, mask_cache)
+                pred_all = model(bx, input_mask, station_ids=bsid, station_geo=bgeo)
+                pred = pred_all.index_select(1, target_idx_tensor)
+                total += criterion(pred, by).detach().float()
+                n_batches += 1
+        if n_batches == 0:
+            return float("inf")
+        return float((total / n_batches).item())
+
+    @staticmethod
+    def _predict_tensors(
+        model: nn.Module,
+        *,
+        x: torch.Tensor,
+        sid: torch.Tensor,
+        geo: torch.Tensor,
+        target_idx_tensor: torch.Tensor,
+        batch_size: int,
+        mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor],
+    ) -> np.ndarray:
+        out: list[np.ndarray] = []
+        model.eval()
+        with torch.no_grad():
+            n = int(x.shape[0])
+            for start in range(0, n, int(batch_size)):
+                end = min(start + int(batch_size), n)
+                bx = x[start:end]
+                bsid = sid[start:end]
+                bgeo = geo[start:end]
+                input_mask = ForecastModelMixin._input_mask(bx, mask_cache)
+                pred_all = model(bx, input_mask, station_ids=bsid, station_geo=bgeo)
+                pred = pred_all.index_select(1, target_idx_tensor)
+                out.append(pred.detach().cpu().numpy())
+        if not out:
+            return np.empty((0, int(target_idx_tensor.numel())), dtype=np.float32)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    @staticmethod
     def _predict_batches(
         model: nn.Module,
         data_loader,
@@ -223,32 +300,47 @@ class ForecastModelMixin:
             min_lr=float(runtime_cfg.scheduler_min_lr),
         )
 
-        sid_train, geo_train = self._station_payload(len(x_train), train_station_ids, train_station_geo)
-        train_loader = self._build_loader(
-            x_train,
-            y_train,
-            sid_train,
-            geo_train,
-            int(training_cfg.batch_size),
-            True,
-            amp,
-            runtime_cfg,
-        )
-
+        sid_train_np, geo_train_np = self._station_payload(len(x_train), train_station_ids, train_station_geo)
         if len(x_val) > 0:
-            sid_val, geo_val = self._station_payload(len(x_val), val_station_ids, val_station_geo)
-            val_loader = self._build_loader(
-                x_val,
-                y_val,
-                sid_val,
-                geo_val,
+            sid_val_np, geo_val_np = self._station_payload(len(x_val), val_station_ids, val_station_geo)
+        else:
+            sid_val_np, geo_val_np = np.empty((0,), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
+
+        # Keep training/val tensors on GPU to reduce CPU/dataloader overhead.
+        if device.type == "cuda":
+            x_train_t, y_train_t, sid_train_t, geo_train_t = self._as_device_tensors(
+                x=x_train, y=y_train, station_ids=sid_train_np, station_geo=geo_train_np, device=device
+            )
+            if len(x_val) > 0:
+                x_val_t, y_val_t, sid_val_t, geo_val_t = self._as_device_tensors(
+                    x=x_val, y=y_val, station_ids=sid_val_np, station_geo=geo_val_np, device=device
+                )
+            else:
+                x_val_t = y_val_t = sid_val_t = geo_val_t = None
+        else:
+            train_loader = self._build_loader(
+                x_train,
+                y_train,
+                sid_train_np,
+                geo_train_np,
                 int(training_cfg.batch_size),
-                False,
+                True,
                 amp,
                 runtime_cfg,
             )
-        else:
-            val_loader = None
+            if len(x_val) > 0:
+                val_loader = self._build_loader(
+                    x_val,
+                    y_val,
+                    sid_val_np,
+                    geo_val_np,
+                    int(training_cfg.batch_size),
+                    False,
+                    amp,
+                    runtime_cfg,
+                )
+            else:
+                val_loader = None
 
         criterion = nn.MSELoss()
         target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
@@ -261,36 +353,75 @@ class ForecastModelMixin:
 
         for epoch in range(1, int(training_cfg.epochs) + 1):
             active_model.train()
-            running, n_batches = 0.0, 0
-            for bx, by, sid, geo in train_loader:
-                bx = bx.to(device, non_blocking=amp)
-                by = by.to(device, non_blocking=amp)
-                sid = sid.to(device, non_blocking=amp)
-                geo = geo.to(device, non_blocking=amp)
+            running = torch.zeros((), device=device, dtype=torch.float32)
+            n_batches = 0
 
-                input_mask = self._input_mask(bx, mask_cache)
+            if device.type == "cuda":
+                n = int(x_train_t.shape[0])
+                perm = torch.randperm(n, device=device)
+                bs = int(training_cfg.batch_size)
+                for start_idx in range(0, n, bs):
+                    idx = perm[start_idx : start_idx + bs]
+                    bx = x_train_t.index_select(0, idx)
+                    by = y_train_t.index_select(0, idx)
+                    sid = sid_train_t.index_select(0, idx)
+                    geo = geo_train_t.index_select(0, idx)
+                    input_mask = self._input_mask(bx, mask_cache)
 
-                optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type, enabled=amp):
-                    pred_all = active_model(bx, input_mask, station_ids=sid, station_geo=geo)
-                    pred = pred_all.index_select(1, target_idx_tensor)
-                    loss = criterion(pred, by)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type=device.type, enabled=amp):
+                        pred_all = active_model(bx, input_mask, station_ids=sid, station_geo=geo)
+                        pred = pred_all.index_select(1, target_idx_tensor)
+                        loss = criterion(pred, by)
 
-                if torch.isfinite(loss).item():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(active_model.parameters(), max_norm=float(runtime_cfg.grad_clip_norm))
                     scaler.step(optimizer)
                     scaler.update()
-                    running += float(loss.item())
+                    running += loss.detach().float()
                     n_batches += 1
 
-            train_loss = running / max(n_batches, 1)
-            metric = (
-                self._eval_loss(active_model, val_loader, device, target_idx_tensor, amp)
-                if val_loader is not None
-                else train_loss
-            )
+                train_loss = float((running / max(n_batches, 1)).item())
+                if x_val_t is not None:
+                    metric = self._eval_loss_tensors(
+                        active_model,
+                        x=x_val_t,
+                        y=y_val_t,
+                        sid=sid_val_t,
+                        geo=geo_val_t,
+                        target_idx_tensor=target_idx_tensor,
+                        batch_size=int(training_cfg.batch_size),
+                        mask_cache=mask_cache,
+                    )
+                else:
+                    metric = train_loss
+            else:
+                for bx, by, sid, geo in train_loader:
+                    bx = bx.to(device, non_blocking=amp)
+                    by = by.to(device, non_blocking=amp)
+                    sid = sid.to(device, non_blocking=amp)
+                    geo = geo.to(device, non_blocking=amp)
+
+                    input_mask = self._input_mask(bx, mask_cache)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type=device.type, enabled=amp):
+                        pred_all = active_model(bx, input_mask, station_ids=sid, station_geo=geo)
+                        pred = pred_all.index_select(1, target_idx_tensor)
+                        loss = criterion(pred, by)
+
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(active_model.parameters(), max_norm=float(runtime_cfg.grad_clip_norm))
+                    scaler.step(optimizer)
+                    scaler.update()
+                    running += loss.detach().float()
+                    n_batches += 1
+
+                train_loss = float((running / max(n_batches, 1)).item())
+                metric = self._eval_loss(active_model, val_loader, device, target_idx_tensor, amp) if val_loader is not None else train_loss
+
             scheduler.step(metric)
 
             if epoch == 1 or epoch % int(training_cfg.log_every) == 0:
@@ -303,7 +434,8 @@ class ForecastModelMixin:
                 best_metric = metric
                 best_epoch = epoch
                 patience_counter = 0
-                best_state = {k: v.detach().cpu().clone() for k, v in module_self.state_dict().items()}
+                # Keep best weights on-device to avoid CPU transfers that stall the GPU.
+                best_state = {k: v.detach().clone() for k, v in module_self.state_dict().items()}
             else:
                 patience_counter += 1
 
@@ -334,6 +466,26 @@ class ForecastModelMixin:
         module_self.to(device)
         amp = device.type == "cuda"
         sid, geo = self._station_payload(len(x), station_ids, station_geo)
+        target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
+        if device.type == "cuda":
+            x_t, _, sid_t, geo_t = self._as_device_tensors(
+                x=x,
+                y=np.zeros((len(x), len(target_indices)), dtype=np.float32),
+                station_ids=sid,
+                station_geo=geo,
+                device=device,
+            )
+            mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
+            return self._predict_tensors(
+                module_self,
+                x=x_t,
+                sid=sid_t,
+                geo=geo_t,
+                target_idx_tensor=target_idx_tensor,
+                batch_size=int(batch_size),
+                mask_cache=mask_cache,
+            )
+
         y_stub = np.zeros((len(x), len(target_indices)), dtype=np.float32)
         data_loader = self._build_loader(
             x,
@@ -345,5 +497,4 @@ class ForecastModelMixin:
             amp,
             runtime_cfg,
         )
-        target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
         return self._predict_batches(module_self, data_loader, device, target_idx_tensor, amp)
