@@ -12,6 +12,7 @@ env/
 
 # Local tooling
 .vscode/
+.env
 .dvc/config.local
 .dvc/tmp/
 .dvc/cache/

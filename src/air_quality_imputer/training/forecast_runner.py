@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -79,6 +80,21 @@ def to_plain_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return {str(key): val for key, val in value.items()}
     return {}
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip().strip("'").strip('"')
+        os.environ[key] = value
 
 
 def model_runtime_cfg(cfg: DictConfig, model_kind: ModelKind) -> DictConfig:
@@ -1217,6 +1233,7 @@ def run(cfg: DictConfig) -> None:
 
 
 def run_from_params(params_path: Path) -> None:
+    load_env_file(Path(".env"))
     cfg = OmegaConf.load(params_path)
     if not isinstance(cfg, DictConfig):
         raise TypeError(f"Expected DictConfig from {params_path}, got {type(cfg)!r}")
