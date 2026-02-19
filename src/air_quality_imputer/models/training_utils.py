@@ -9,8 +9,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+_CUDA_RUNTIME_CONFIGURED = False
+
+
 def configure_cuda_runtime(device: torch.device) -> None:
+    global _CUDA_RUNTIME_CONFIGURED
     if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    if _CUDA_RUNTIME_CONFIGURED:
         return
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
@@ -19,6 +25,7 @@ def configure_cuda_runtime(device: torch.device) -> None:
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
+    _CUDA_RUNTIME_CONFIGURED = True
 
 
 def maybe_compile_model(model: nn.Module, config, device: torch.device) -> nn.Module:

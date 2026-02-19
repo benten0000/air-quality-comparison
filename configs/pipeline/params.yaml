@@ -91,6 +91,7 @@ models:
     runtime:
       bias: true
       use_torch_compile: true
+      amp_dtype: auto
       compile_mode: reduce-overhead
       compile_dynamic: false
 
@@ -125,7 +126,8 @@ models:
     type: lstm
     runtime:
       bias: true
-      use_torch_compile: true
+      use_torch_compile: false
+      amp_dtype: auto
       compile_mode: reduce-overhead
       compile_dynamic: false
       optimizer_lr: 0.0001 #0.000005
@@ -149,7 +151,8 @@ models:
     type: gru
     runtime:
       bias: true
-      use_torch_compile: true
+      use_torch_compile: false
+      amp_dtype: auto
       compile_mode: reduce-overhead
       compile_dynamic: false
       optimizer_lr: 0.0001 #0.000005
@@ -172,7 +175,8 @@ models:
     type: hybrid_loclstm
     runtime:
       bias: true
-      use_torch_compile: true
+      use_torch_compile: false
+      amp_dtype: auto
       compile_mode: reduce-overhead
       compile_dynamic: false
       optimizer_lr: 0.0001 #0.000005
@@ -216,6 +220,9 @@ output:
 
 tracking:
   enabled: true
+  # Speed mode defaults: avoid repeated heavy MLflow artifact/dataset logging in large 5-fold runs.
+  log_dataset_every_run: false
+  log_per_station_torch_models: false
   experiment: air-quality-missing-data-imputation
   experiment_standard: comperosion-normal
   experiment_five_fold: comperosion-5fold

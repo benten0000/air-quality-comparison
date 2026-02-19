@@ -14,10 +14,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from sklearn.metrics import explained_variance_score, r2_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 
+from air_quality_imputer.models.training_utils import configure_cuda_runtime
 from air_quality_imputer.models.recurrent_forecasters import (
     GRUForecaster,
     HybridLocLSTM,
@@ -37,6 +37,12 @@ RUNTIME_DEFAULTS: dict[str, Any] = {
     "use_torch_compile": True,
     "compile_mode": "reduce-overhead",
     "compile_dynamic": False,
+    # AMP dtype selection is used inside ForecastModelMixin.
+    # "auto": prefer bf16 on modern NVIDIA GPUs when supported.
+    "amp_dtype": "auto",  # "auto" | "fp16" | "bf16"
+    # When running on CUDA, optionally preload the full dataset to GPU tensors.
+    # Per-station uses an adaptive check and may flip this off.
+    "cuda_preload": True,
     "optimizer_fused": True,
     "optimizer_weight_decay": 0.01,
     "scheduler_reduce_factor": 0.5,
@@ -110,6 +116,27 @@ class GlobalPrepared(TypedDict):
     sid_test: np.ndarray
     geo_test: np.ndarray
     test_counts: list[int]
+
+
+class PerStationCudaData(TypedDict):
+    x_train: torch.Tensor
+    y_train: torch.Tensor
+    x_val: torch.Tensor
+    y_val: torch.Tensor
+    sid_train: torch.Tensor
+    geo_train: torch.Tensor
+    sid_val: torch.Tensor
+    geo_val: torch.Tensor
+    x_test: torch.Tensor
+    sid_test: torch.Tensor
+    geo_test: torch.Tensor
+
+
+class WindowIndex(TypedDict):
+    start_idx: np.ndarray
+    target_idx: np.ndarray
+    start_ts: np.ndarray
+    target_ts: np.ndarray
 
 
 def to_plain_dict(value: Any) -> dict[str, Any]:
@@ -196,9 +223,44 @@ def metrics(
         "wape": wape,
         "mse": mse,
         "rmse": float(np.sqrt(mse)),
-        "evs": float(explained_variance_score(y_true, y_pred, multioutput="uniform_average")),
-        "r2": float(r2_score(y_true, y_pred, multioutput="uniform_average")),
+        "evs": _explained_variance_uniform(y_true, y_pred),
+        "r2": _r2_uniform(y_true, y_pred),
     }
+
+
+def _as_2d_float64(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float64)
+    if arr.ndim == 1:
+        return arr[:, None]
+    return arr
+
+
+def _explained_variance_uniform(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    yt = _as_2d_float64(y_true)
+    yp = _as_2d_float64(y_pred)
+    var_y = np.var(yt, axis=0)
+    var_err = np.var(yt - yp, axis=0)
+    out = np.empty_like(var_y, dtype=np.float64)
+    nz = var_y > 0.0
+    out[nz] = 1.0 - (var_err[nz] / var_y[nz])
+    if bool((~nz).any()):
+        out[~nz] = np.where(var_err[~nz] <= np.finfo(np.float64).eps, 1.0, 0.0)
+    return float(np.mean(out))
+
+
+def _r2_uniform(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    yt = _as_2d_float64(y_true)
+    yp = _as_2d_float64(y_pred)
+    diff = yt - yp
+    ss_res = np.sum(diff * diff, axis=0)
+    centered = yt - np.mean(yt, axis=0)
+    ss_tot = np.sum(centered * centered, axis=0)
+    out = np.empty_like(ss_tot, dtype=np.float64)
+    nz = ss_tot > 0.0
+    out[nz] = 1.0 - (ss_res[nz] / ss_tot[nz])
+    if bool((~nz).any()):
+        out[~nz] = np.where(ss_res[~nz] <= np.finfo(np.float64).eps, 1.0, 0.0)
+    return float(np.mean(out))
 
 
 def load_frames(
@@ -214,13 +276,24 @@ def load_frames(
     non_station_features = [feature for feature in features if feature != "station"]
     required_base = [datetime_col] + non_station_features
     out: dict[str, pd.DataFrame] = {}
+    read_cols = {datetime_col, *non_station_features, "station"}
+    dtype_map: dict[str, Any] = {col: "float32" for col in non_station_features}
 
     for source_name in source_names:
         csv_path = data_dir / f"{source_name}.csv"
         if not csv_path.is_file():
             raise FileNotFoundError(f"Missing data source: {csv_path}")
 
-        frame = pd.read_csv(csv_path)
+        try:
+            frame = pd.read_csv(
+                csv_path,
+                usecols=lambda col: col in read_cols,
+                parse_dates=[datetime_col],
+                dtype=cast(Any, dtype_map) if dtype_map else None,
+                low_memory=False,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid schema or numeric values in {csv_path}: {exc}") from exc
         if frame.empty:
             continue
         frame = frame.copy()
@@ -234,7 +307,8 @@ def load_frames(
             raise ValueError(f"Missing required columns in {csv_path}: {missing_cols}")
 
         work = frame[[datetime_col] + non_station_features + ["_station_label"]].copy()
-        work[datetime_col] = pd.to_datetime(work[datetime_col], errors="coerce")
+        if not pd.api.types.is_datetime64_any_dtype(work[datetime_col].dtype):
+            work[datetime_col] = pd.to_datetime(work[datetime_col], errors="coerce")
         work = work.dropna(subset=[datetime_col]).copy()
         work["_station_label"] = work["_station_label"].astype(str).str.strip()
         work = work[work["_station_label"] != ""]
@@ -242,7 +316,6 @@ def load_frames(
             continue
 
         if non_station_features:
-            work[non_station_features] = work[non_station_features].apply(pd.to_numeric, errors="coerce")
             if work[non_station_features].isna().any().any():
                 raise ValueError(f"Invalid numeric values in {csv_path}")
 
@@ -317,28 +390,50 @@ def load_station_geo_vectors(cfg: DictConfig, stations: list[str]) -> dict[str, 
     return {st: parsed.get(st, default[st]) for st in stations}
 
 
-def make_samples(
-    values: np.ndarray,
+def build_window_index(
     times: np.ndarray,
     history_length: int,
     horizon: int,
-    target_indices: list[int],
     step_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    t = int(values.shape[0])
+) -> WindowIndex:
+    t = int(times.shape[0])
     if t < int(history_length) + int(horizon):
-        return (
-            np.empty((0, history_length, values.shape[1]), dtype=np.float32),
-            np.empty((0, len(target_indices)), dtype=np.float32),
-            np.empty((0,), dtype="datetime64[ns]"),
-        )
-    ends = np.arange(int(history_length), t - int(horizon) + 1, int(step_size))
-    x_all = np.lib.stride_tricks.sliding_window_view(values, int(history_length), axis=0).swapaxes(1, 2)
-    x = x_all[ends - int(history_length)].astype(np.float32, copy=False)
-    t_idx = ends + int(horizon) - 1
-    y = values[t_idx][:, target_indices].astype(np.float32, copy=False)
-    ts = times[t_idx].astype("datetime64[ns]", copy=False)
-    return x, y, ts
+        return {
+            "start_idx": np.empty((0,), dtype=np.int64),
+            "target_idx": np.empty((0,), dtype=np.int64),
+            "start_ts": np.empty((0,), dtype="datetime64[ns]"),
+            "target_ts": np.empty((0,), dtype="datetime64[ns]"),
+        }
+    end_idx = np.arange(int(history_length), t - int(horizon) + 1, int(step_size), dtype=np.int64)
+    start_idx = end_idx - int(history_length)
+    target_idx = end_idx + int(horizon) - 1
+    return {
+        "start_idx": start_idx,
+        "target_idx": target_idx,
+        "start_ts": times[start_idx].astype("datetime64[ns]", copy=False),
+        "target_ts": times[target_idx].astype("datetime64[ns]", copy=False),
+    }
+
+
+def _scale_float32(values: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    mean32, scale32 = _scaler_stats_float32(scaler)
+    return (values - mean32) / scale32
+
+
+def _scaler_stats_float32(scaler: StandardScaler) -> tuple[np.ndarray, np.ndarray]:
+    mean = scaler.mean_
+    scale = scaler.scale_
+    if mean is None or scale is None:
+        raise ValueError("Scaler must be fitted before extracting stats")
+    mean32 = getattr(scaler, "_aqi_mean32", None)
+    scale32 = getattr(scaler, "_aqi_scale32", None)
+    if isinstance(mean32, np.ndarray) and isinstance(scale32, np.ndarray):
+        return mean32, scale32
+    mean32 = np.asarray(mean, dtype=np.float32)
+    scale32 = np.asarray(scale, dtype=np.float32)
+    setattr(scaler, "_aqi_mean32", mean32)
+    setattr(scaler, "_aqi_scale32", scale32)
+    return mean32, scale32
 
 
 def build_split(
@@ -354,40 +449,42 @@ def build_split(
     train_end: pd.Timestamp,
     val_end: pd.Timestamp,
     eval_start: pd.Timestamp,
+    window_index: WindowIndex | None = None,
 ) -> dict[str, np.ndarray]:
     # load_frames already coerces datetime_col; avoid repeated pd.to_datetime overhead.
     times = frame[datetime_col].to_numpy(dtype="datetime64[ns]")
-    scaled = scaler.transform(frame[features].to_numpy(dtype=np.float32)).astype(np.float32)
+    scaled = _scale_float32(frame[features].to_numpy(dtype=np.float32), scaler)
+    win = build_window_index(times, history_length, horizon, step_size) if window_index is None else window_index
+    start_idx = win["start_idx"]
+    target_idx = win["target_idx"]
+    if len(start_idx) == 0:
+        return {
+            "x_train": np.empty((0, history_length, len(features)), dtype=np.float32),
+            "y_train": np.empty((0, len(target_indices)), dtype=np.float32),
+            "x_val": np.empty((0, history_length, len(features)), dtype=np.float32),
+            "y_val": np.empty((0, len(target_indices)), dtype=np.float32),
+            "x_test": np.empty((0, history_length, len(features)), dtype=np.float32),
+            "y_test": np.empty((0, len(target_indices)), dtype=np.float32),
+        }
 
-    train_mask = (times >= np.datetime64(train_start)) & (times < np.datetime64(train_end))
-    x_train, y_train, _ = make_samples(
-        scaled[train_mask],
-        times[train_mask],
-        history_length,
-        horizon,
-        target_indices,
-        step_size,
-    )
+    x_view = np.lib.stride_tricks.sliding_window_view(scaled, int(history_length), axis=0).swapaxes(1, 2)
+    y_base = scaled[target_idx][:, target_indices].astype(np.float32, copy=False)
 
-    val_mask = (times >= np.datetime64(train_end)) & (times < np.datetime64(val_end))
-    x_val, y_val, _ = make_samples(
-        scaled[val_mask],
-        times[val_mask],
-        history_length,
-        horizon,
-        target_indices,
-        step_size,
-    )
+    train_start64 = np.datetime64(train_start)
+    train_end64 = np.datetime64(train_end)
+    val_end64 = np.datetime64(val_end)
+    eval_start64 = np.datetime64(eval_start)
+    train_mask = (win["start_ts"] >= train_start64) & (win["target_ts"] < train_end64)
+    val_mask = (win["start_ts"] >= train_end64) & (win["target_ts"] < val_end64)
+    eval_mask = win["target_ts"] >= eval_start64
 
-    x_all, y_all, t_all = make_samples(scaled, times, history_length, horizon, target_indices, step_size)
-    eval_mask = t_all >= np.datetime64(eval_start)
     return {
-        "x_train": x_train,
-        "y_train": y_train,
-        "x_val": x_val,
-        "y_val": y_val,
-        "x_test": x_all[eval_mask],
-        "y_test": y_all[eval_mask],
+        "x_train": x_view[start_idx[train_mask]].astype(np.float32, copy=False),
+        "y_train": y_base[train_mask].astype(np.float32, copy=False),
+        "x_val": x_view[start_idx[val_mask]].astype(np.float32, copy=False),
+        "y_val": y_base[val_mask].astype(np.float32, copy=False),
+        "x_test": x_view[start_idx[eval_mask]].astype(np.float32, copy=False),
+        "y_test": y_base[eval_mask].astype(np.float32, copy=False),
     }
 
 
@@ -401,6 +498,7 @@ def prepare_global_data(
     cfg: DictConfig,
     station_to_id: dict[str, int],
     station_geo_map: dict[str, np.ndarray],
+    window_cache: dict[str, WindowIndex] | None = None,
 ) -> GlobalPrepared:
     features = list(cfg.data.features)
     target_features = list(cfg.data.target_features)
@@ -429,6 +527,7 @@ def prepare_global_data(
                 train_end,
                 val_end,
                 eval_start,
+                window_index=(window_cache.get(st) if window_cache is not None else None),
             ),
         )
         if len(splits[st]["x_train"]) == 0:
@@ -510,6 +609,7 @@ def prepare_per_station_data(
     eval_start: pd.Timestamp,
     cfg: DictConfig,
     station_geo_map: dict[str, np.ndarray],
+    window_cache: dict[str, WindowIndex] | None = None,
 ) -> dict[str, PerStationData]:
     features = list(cfg.data.features)
     target_features = list(cfg.data.target_features)
@@ -545,6 +645,7 @@ def prepare_per_station_data(
                 train_end,
                 val_end,
                 eval_start,
+                window_index=(window_cache.get(st) if window_cache is not None else None),
             ),
         )
         if len(splits["x_train"]) == 0:
@@ -578,11 +679,8 @@ def prepare_per_station_data(
 
 
 def inverse_scale_targets(y_scaled: np.ndarray, scaler: StandardScaler, target_indices: list[int]) -> np.ndarray:
-    mean = scaler.mean_
-    scale = scaler.scale_
-    if mean is None or scale is None:
-        raise ValueError("Scaler must be fitted before inverse scaling targets")
-    return y_scaled * scale[target_indices] + mean[target_indices]
+    mean32, scale32 = _scaler_stats_float32(scaler)
+    return y_scaled * scale32[target_indices] + mean32[target_indices]
 
 
 def build_model(
@@ -695,16 +793,16 @@ def fit_global_scaler(
     train_starts: dict[str, pd.Timestamp],
     train_end: pd.Timestamp,
 ) -> StandardScaler:
-    blocks = []
+    sc = StandardScaler()
+    fitted = False
     for st, frame in frames.items():
         m = (frame[datetime_col] >= train_starts[st]) & (frame[datetime_col] < train_end)
         arr = frame.loc[m, features].to_numpy(dtype=np.float32)
         if arr.size:
-            blocks.append(arr)
-    if not blocks:
+            sc.partial_fit(arr)
+            fitted = True
+    if not fitted:
         raise ValueError("No training rows available for global scaler")
-    sc = StandardScaler()
-    sc.fit(np.concatenate(blocks, axis=0))
     return sc
 
 
@@ -764,6 +862,9 @@ def run_approach(
 
     dev = device_from_cfg(str(training_cfg.device))
     runtime_cfg = model_runtime_cfg(cfg, model_kind)
+    # cuDNN RNN kernels are already highly optimized; torch.compile overhead often does not pay off.
+    if model_kind in ("lstm", "gru", "hybrid_loclstm"):
+        runtime_cfg.use_torch_compile = False
 
     model = build_model(
         cfg,
@@ -872,6 +973,7 @@ def run_approach_per_station(
     tracker: MLflowTracker | None = None,
     model_artifact_path_prefix: str = "model",
     prepared: dict[str, PerStationData] | None = None,
+    log_station_models: bool = False,
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -884,9 +986,6 @@ def run_approach_per_station(
     stations = sorted(frames)
     dev = device_from_cfg(str(training_cfg.device))
 
-    datetime_col = str(cfg.data.datetime_col)
-    horizon = int(cfg.experiment.common.forecast_horizon)
-    step_size = int(cfg.experiment.common.step_size)
     runtime_cfg = model_runtime_cfg(cfg, model_kind)
     # Per-station baseline runs many short trainings in sequence.
     # Force single-process dataloading to avoid intermittent multiprocessing/pin-memory crashes.
@@ -894,6 +993,12 @@ def run_approach_per_station(
     runtime_cfg_per_station.dataloader_num_workers = 0
     runtime_cfg_per_station.dataloader_persistent_workers = False
     runtime_cfg_per_station.dataloader_pin_memory = False
+    # Speed-first: collapse per-station epochs to ~1 step/epoch when feasible.
+    runtime_cfg_per_station.batch_mode = "full"
+    # For many short per-station RNN fits, compile startup cost often dominates.
+    if model_kind in ("lstm", "gru", "hybrid_loclstm"):
+        runtime_cfg_per_station.use_torch_compile = False
+    runtime_cfg_per_station.eval_every = int(OmegaConf.select(runtime_cfg_per_station, "eval_every", default=5))
 
     if prepared is None:
         prepared = prepare_per_station_data(
@@ -910,6 +1015,50 @@ def run_approach_per_station(
     total_time = 0.0
 
     per_station = prepared
+    per_station_cuda: dict[str, PerStationCudaData] | None = None
+    if dev.type == "cuda":
+        # Adaptive VRAM check: if preloading all per-station tensors would consume too much
+        # free VRAM, fall back to streaming via DataLoader + pinned memory.
+        free_b, _total_b = torch.cuda.mem_get_info(dev)
+        est_b = 0
+        for st in stations:
+            station_pack = per_station[st]
+            splits = station_pack["splits"]
+            est_b += int(splits["x_train"].nbytes)
+            est_b += int(splits["y_train"].nbytes)
+            est_b += int(splits["x_val"].nbytes)
+            est_b += int(splits["y_val"].nbytes)
+            est_b += int(splits["x_test"].nbytes)
+            est_b += int(station_pack["sid_train"].nbytes)
+            est_b += int(station_pack["geo_train"].nbytes)
+            est_b += int(station_pack["sid_val"].nbytes)
+            est_b += int(station_pack["geo_val"].nbytes)
+            est_b += int(station_pack["sid_test"].nbytes)
+            est_b += int(station_pack["geo_test"].nbytes)
+
+        preload_ok = est_b <= int(float(free_b) * 0.60)
+        if preload_ok and bool(OmegaConf.select(runtime_cfg_per_station, "cuda_preload", default=True)):
+            per_station_cuda = {}
+            for st in stations:
+                station_pack = per_station[st]
+                splits = station_pack["splits"]
+                per_station_cuda[st] = {
+                    "x_train": torch.from_numpy(splits["x_train"]).to(dev, non_blocking=False),
+                    "y_train": torch.from_numpy(splits["y_train"]).to(dev, non_blocking=False),
+                    "x_val": torch.from_numpy(splits["x_val"]).to(dev, non_blocking=False),
+                    "y_val": torch.from_numpy(splits["y_val"]).to(dev, non_blocking=False),
+                    "sid_train": torch.from_numpy(station_pack["sid_train"]).to(dev, non_blocking=False),
+                    "geo_train": torch.from_numpy(station_pack["geo_train"]).to(dev, non_blocking=False),
+                    "sid_val": torch.from_numpy(station_pack["sid_val"]).to(dev, non_blocking=False),
+                    "geo_val": torch.from_numpy(station_pack["geo_val"]).to(dev, non_blocking=False),
+                    "x_test": torch.from_numpy(splits["x_test"]).to(dev, non_blocking=False),
+                    "sid_test": torch.from_numpy(station_pack["sid_test"]).to(dev, non_blocking=False),
+                    "geo_test": torch.from_numpy(station_pack["geo_test"]).to(dev, non_blocking=False),
+                }
+        else:
+            # Force streaming path in ForecastModelMixin on CUDA.
+            runtime_cfg_per_station.cuda_preload = False
+            runtime_cfg_per_station.dataloader_pin_memory = True
 
     # Reuse a single model instance across stations (reset weights) to avoid rebuild/compile overhead.
     model = build_model(
@@ -928,41 +1077,71 @@ def run_approach_per_station(
         model.load_state_dict(init_state)
         scaler = per_station[st]["scaler"]
         splits = per_station[st]["splits"]
-        sid_train = per_station[st]["sid_train"]
-        geo_train = per_station[st]["geo_train"]
-        sid_val = per_station[st]["sid_val"]
-        geo_val = per_station[st]["geo_val"]
-
-        total_time += fit_model(
-            model,
-            x_train=splits["x_train"],
-            y_train=splits["y_train"],
-            x_val=splits["x_val"],
-            y_val=splits["y_val"],
-            target_indices=target_idx,
-            training_cfg=training_cfg,
-            runtime_cfg=runtime_cfg_per_station,
-            seed=int(cfg.seed) + fold_id * 1000 + idx + 1,
-            train_station_ids=sid_train,
-            train_station_geo=geo_train,
-            val_station_ids=sid_val,
-            val_station_geo=geo_val,
-        )
-        if tracker is not None:
+        if per_station_cuda is not None:
+            cuda_pack = per_station_cuda[st]
+            total_time += fit_model(
+                model,
+                x_train=cuda_pack["x_train"],
+                y_train=cuda_pack["y_train"],
+                x_val=cuda_pack["x_val"],
+                y_val=cuda_pack["y_val"],
+                target_indices=target_idx,
+                training_cfg=training_cfg,
+                runtime_cfg=runtime_cfg_per_station,
+                seed=int(cfg.seed) + fold_id * 1000 + idx + 1,
+                train_station_ids=cuda_pack["sid_train"],
+                train_station_geo=cuda_pack["geo_train"],
+                val_station_ids=cuda_pack["sid_val"],
+                val_station_geo=cuda_pack["geo_val"],
+            )
+        else:
+            sid_train = per_station[st]["sid_train"]
+            geo_train = per_station[st]["geo_train"]
+            sid_val = per_station[st]["sid_val"]
+            geo_val = per_station[st]["geo_val"]
+            total_time += fit_model(
+                model,
+                x_train=splits["x_train"],
+                y_train=splits["y_train"],
+                x_val=splits["x_val"],
+                y_val=splits["y_val"],
+                target_indices=target_idx,
+                training_cfg=training_cfg,
+                runtime_cfg=runtime_cfg_per_station,
+                seed=int(cfg.seed) + fold_id * 1000 + idx + 1,
+                train_station_ids=sid_train,
+                train_station_geo=geo_train,
+                val_station_ids=sid_val,
+                val_station_geo=geo_val,
+            )
+        if tracker is not None and log_station_models:
             tracker.log_torch_model(model, artifact_path=f"{model_artifact_path_prefix}__{_slug(st)}")
 
-        sid_test = per_station[st]["sid_test"]
-        geo_test = per_station[st]["geo_test"]
-        pred_scaled = predict_model(
-            model,
-            x=splits["x_test"],
-            target_indices=target_idx,
-            batch_size=int(training_cfg.batch_size),
-            device=dev,
-            runtime_cfg=runtime_cfg_per_station,
-            station_ids=sid_test,
-            station_geo=geo_test,
-        )
+        if per_station_cuda is not None:
+            cuda_pack = per_station_cuda[st]
+            pred_scaled = predict_model(
+                model,
+                x=cuda_pack["x_test"],
+                target_indices=target_idx,
+                batch_size=int(training_cfg.batch_size),
+                device=dev,
+                runtime_cfg=runtime_cfg_per_station,
+                station_ids=cuda_pack["sid_test"],
+                station_geo=cuda_pack["geo_test"],
+            )
+        else:
+            sid_test = per_station[st]["sid_test"]
+            geo_test = per_station[st]["geo_test"]
+            pred_scaled = predict_model(
+                model,
+                x=splits["x_test"],
+                target_indices=target_idx,
+                batch_size=int(training_cfg.batch_size),
+                device=dev,
+                runtime_cfg=runtime_cfg_per_station,
+                station_ids=sid_test,
+                station_geo=geo_test,
+            )
         y_true = inverse_scale_targets(splits["y_test"], scaler, target_idx)
         y_pred = inverse_scale_targets(pred_scaled, scaler, target_idx)
         station_rows.append(
@@ -1024,6 +1203,10 @@ def run_scenario(
         print(f"Reduced-data stations ({len(reduced_stations)}): {', '.join(reduced_stations)}")
     training_cfg = cfg.training
     model_kinds = resolve_model_kinds(cfg)
+    datetime_col = str(cfg.data.datetime_col)
+    history_length = int(cfg.experiment.common.history_length)
+    horizon = int(cfg.experiment.common.forecast_horizon)
+    step_size = int(cfg.experiment.common.step_size)
     stations = sorted(frames)
     station_to_id = {st: idx for idx, st in enumerate(stations)}
     station_geo_map = load_station_geo_vectors(cfg, stations)
@@ -1032,9 +1215,6 @@ def run_scenario(
         f"batch_size={int(training_cfg.batch_size)}, lr=model-specific"
     )
     print(f"[INFO] Models: {', '.join(model_kinds)}")
-
-    reports_dir = Path(str(cfg.paths.reports_dir))
-    reports_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {
         "data_source": source_name,
@@ -1050,8 +1230,8 @@ def run_scenario(
 
     time_range_by_station = {
         st: {
-            "min": str(frames[st][str(cfg.data.datetime_col)].min()),
-            "max": str(frames[st][str(cfg.data.datetime_col)].max()),
+            "min": str(frames[st][datetime_col].min()),
+            "max": str(frames[st][datetime_col].max()),
         }
         for st in stations
     }
@@ -1062,7 +1242,7 @@ def run_scenario(
         "sources_used": list(sources_used),
         "scenario": scenario_name,
         "fold": int(fold_id),
-        "datetime_col": str(cfg.data.datetime_col),
+        "datetime_col": datetime_col,
         "features": list(cfg.data.features),
         "target_features": list(cfg.data.target_features),
         "stations": list(stations),
@@ -1078,28 +1258,34 @@ def run_scenario(
     dataset_manifest_sha1 = hashlib.sha1(dataset_manifest_json.encode("utf-8")).hexdigest()
 
     reduced_set = set(reduced_stations)
-    dataset_rows = cast(
-        list[Mapping[str, Any]],
-        [
-            {
-                "station": str(st),
-                "fold": int(fold_id),
-                "source_name": str(source_name),
-                "scenario": str(scenario_name),
-                "is_reduced": st in reduced_set,
-                "n_rows": int(len(frames[st])),
-                "train_start": str(train_starts[st]),
-                "train_end": str(train_end),
-                "val_end": str(val_end),
-                "test_start": str(eval_start),
-                "time_min": str(frames[st][str(cfg.data.datetime_col)].min()),
-                "time_max": str(frames[st][str(cfg.data.datetime_col)].max()),
-            }
-            for st in stations
-        ],
-    )
+    dataset_rows: list[dict[str, Any]] = [
+        {
+            "station": str(st),
+            "fold": int(fold_id),
+            "source_name": str(source_name),
+            "scenario": str(scenario_name),
+            "is_reduced": st in reduced_set,
+            "n_rows": int(len(frames[st])),
+            "train_start": str(train_starts[st]),
+            "train_end": str(train_end),
+            "val_end": str(val_end),
+            "test_start": str(eval_start),
+            "time_min": str(frames[st][datetime_col].min()),
+            "time_max": str(frames[st][datetime_col].max()),
+        }
+        for st in stations
+    ]
     summary_rows: list[dict[str, float | int | str]] = []
     station_rows: list[dict[str, float | int | str]] = []
+    window_cache = {
+        st: build_window_index(
+            frames[st][datetime_col].to_numpy(dtype="datetime64[ns]"),
+            history_length,
+            horizon,
+            step_size,
+        )
+        for st in stations
+    }
 
     # Prepare dataset splits once per scenario+fold and reuse across all model runs.
     # This removes repeated scaler fitting + windowing work between models.
@@ -1112,6 +1298,7 @@ def run_scenario(
         cfg=cfg,
         station_to_id=station_to_id,
         station_geo_map=station_geo_map,
+        window_cache=window_cache,
     )
     per_station_prepared = prepare_per_station_data(
         frames=frames,
@@ -1121,7 +1308,11 @@ def run_scenario(
         eval_start=eval_start,
         cfg=cfg,
         station_geo_map=station_geo_map,
+        window_cache=window_cache,
     )
+    log_dataset_every_run = bool(OmegaConf.select(cfg, "tracking.log_dataset_every_run", default=False))
+    log_per_station_torch_models = bool(OmegaConf.select(cfg, "tracking.log_per_station_torch_models", default=False))
+    dataset_logged = False
     for model_kind in model_kinds:
         for approach_kind in ("global", "per_station"):
             approach = f"{model_kind}__{approach_kind}"
@@ -1170,20 +1361,22 @@ def run_scenario(
                 )
 
                 tracker.log_params({"manifest_sha1": dataset_manifest_sha1}, prefix="dataset")
-                tracker.log_dict(dataset_manifest, artifact_file="dataset_manifest.json", artifact_path="dataset")
-                tracker.log_dataset_input(
-                    name=dataset_name,
-                    source=str(cfg.data.data_dir),
-                    digest=dataset_manifest_sha1,
-                    context="training",
-                    rows=dataset_rows,
-                    metadata={
-                        "n_sources": len(sources_used),
-                        "n_stations": len(stations),
-                        "missing_months": missing_months,
-                        "reduced_station_count": len(reduced_stations),
-                    },
-                )
+                if log_dataset_every_run or not dataset_logged:
+                    tracker.log_dict(dataset_manifest, artifact_file="dataset_manifest.json", artifact_path="dataset")
+                    tracker.log_dataset_input(
+                        name=dataset_name,
+                        source=str(cfg.data.data_dir),
+                        digest=dataset_manifest_sha1,
+                        context="training",
+                        rows=cast(list[Mapping[str, Any]], dataset_rows),
+                        metadata={
+                            "n_sources": len(sources_used),
+                            "n_stations": len(stations),
+                            "missing_months": missing_months,
+                            "reduced_station_count": len(reduced_stations),
+                        },
+                    )
+                    dataset_logged = True
                 model_manifest: dict[str, Any] = {
                     "display_name": model_display,
                     "model_kind": str(model_kind),
@@ -1244,6 +1437,7 @@ def run_scenario(
                         tracker=tracker,
                         model_artifact_path_prefix=model_artifact_path,
                         prepared=per_station_prepared,
+                        log_station_models=log_per_station_torch_models,
                     )
 
                 if bool(cfg.output.save_models):
@@ -1307,6 +1501,8 @@ def validate_cfg(cfg: DictConfig) -> None:
 
 def run(cfg: DictConfig) -> None:
     set_seed(int(cfg.seed))
+    # One-time CUDA runtime configuration (idempotent).
+    configure_cuda_runtime(device_from_cfg(str(cfg.training.device)))
     paths = cfg.paths
     Path(paths.models_dir).mkdir(parents=True, exist_ok=True)
     tracking_cfg = to_plain_dict(OmegaConf.select(cfg, "tracking", default={}))
@@ -1337,10 +1533,10 @@ def run(cfg: DictConfig) -> None:
             datetime_col=str(cfg.data.datetime_col),
             features=list(cfg.data.features),
         )
+        datetime_col = str(cfg.data.datetime_col)
         stations = sorted(frames)
-        all_times = pd.concat([frame[str(cfg.data.datetime_col)] for frame in frames.values()], ignore_index=True)
-        min_ts = pd.to_datetime(all_times.min())
-        max_ts = pd.to_datetime(all_times.max())
+        min_ts = min(cast(pd.Timestamp, frame[datetime_col].min()) for frame in frames.values())
+        max_ts = max(cast(pd.Timestamp, frame[datetime_col].max()) for frame in frames.values())
         total_seconds = (max_ts - min_ts).total_seconds()
         train_ratio = float(cfg.experiment.standard.train_ratio)
         val_ratio = float(cfg.experiment.standard.val_ratio)
@@ -1349,7 +1545,7 @@ def run(cfg: DictConfig) -> None:
         eval_start = val_end
         missing_months = int(OmegaConf.select(cfg, "experiment.five_fold.missing_months", default=0))
         station_first_ts = {
-            st: pd.to_datetime(frames[st][str(cfg.data.datetime_col)].min()) for st in stations
+            st: cast(pd.Timestamp, frames[st][datetime_col].min()) for st in stations
         }
         reduced_start_by_station = {
             st: station_first_ts[st] + pd.DateOffset(months=missing_months) for st in stations
