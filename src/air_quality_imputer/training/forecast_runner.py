@@ -492,6 +492,7 @@ def run_approach(
     cfg: DictConfig,
     training_cfg: DictConfig,
     fold_id: int,
+    tracker: MLflowTracker | None = None,
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -594,6 +595,8 @@ def run_approach(
         val_station_ids=sid_val,
         val_station_geo=geo_val,
     )
+    if tracker is not None:
+        tracker.log_torch_model(model, artifact_path="model")
 
     station_rows: list[dict[str, float | int | str]] = []
     all_true, all_pred = [], []
@@ -668,6 +671,7 @@ def run_approach_per_station(
     cfg: DictConfig,
     training_cfg: DictConfig,
     fold_id: int,
+    tracker: MLflowTracker | None = None,
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -758,6 +762,8 @@ def run_approach_per_station(
             val_station_ids=sid_val,
             val_station_geo=geo_val,
         )
+        if tracker is not None:
+            tracker.log_torch_model(model, artifact_path=f"model/{st}")
 
         sid_test = np.zeros((len(splits["x_test"]),), dtype=np.int64)
         geo_test = np.repeat(station_geo_map[st][None, :], len(splits["x_test"]), axis=0).astype(np.float32, copy=False)
@@ -930,11 +936,32 @@ def run_scenario(
                 dataset_manifest_sha1 = hashlib.sha1(manifest_json.encode("utf-8")).hexdigest()
                 tracker.log_params({"manifest_sha1": dataset_manifest_sha1}, prefix="dataset")
                 tracker.log_artifact(manifest_path, artifact_path="dataset")
+                reduced_set = set(reduced_stations)
+                dataset_rows = [
+                    {
+                        "station": str(st),
+                        "fold": int(fold_id),
+                        "source_name": str(source_name),
+                        "scenario": str(scenario_name),
+                        "model_kind": str(model_kind),
+                        "approach_kind": str(approach_kind),
+                        "is_reduced": st in reduced_set,
+                        "n_rows": int(len(frames[st])),
+                        "train_start": str(train_starts[st]),
+                        "train_end": str(train_end),
+                        "val_end": str(val_end),
+                        "test_start": str(eval_start),
+                        "time_min": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].min())),
+                        "time_max": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].max())),
+                    }
+                    for st in stations
+                ]
                 tracker.log_dataset_input(
-                    name=f"{source_name}:{scenario_name}:fold{int(fold_id):02d}",
+                    name=f"{source_name}:{scenario_name}:fold{int(fold_id):02d}:{model_kind}:{approach_kind}",
                     source=str(cfg.data.data_dir),
                     digest=dataset_manifest_sha1,
                     context="training",
+                    rows=dataset_rows,
                     metadata={
                         "n_sources": len(sources_used),
                         "n_stations": len(stations),
@@ -976,6 +1003,7 @@ def run_scenario(
                         cfg,
                         training_cfg,
                         fold_id,
+                        tracker=tracker,
                     )
                 else:
                     summary, rows = run_approach_per_station(
@@ -990,6 +1018,7 @@ def run_scenario(
                         cfg,
                         training_cfg,
                         fold_id,
+                        tracker=tracker,
                     )
 
                 if bool(cfg.output.save_models):

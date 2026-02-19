@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 try:
     import mlflow
@@ -162,6 +161,7 @@ class MLflowTracker:
         source: str,
         digest: str,
         context: str = "training",
+        rows: Sequence[Mapping[str, Any]] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if not self.enabled or mlflow is None:
@@ -176,10 +176,21 @@ class MLflowTracker:
 
             import pandas as pd
 
-            row: dict[str, str] = {"name": str(name), "source": str(source), "digest": str(digest)}
-            for key, value in dict(metadata or {}).items():
-                row[str(key)] = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
-            ds = from_pandas(pd.DataFrame([row]), source=str(source), name=str(name))
+            data_rows: list[dict[str, Any]]
+            if rows:
+                data_rows = [dict(r) for r in rows]
+            else:
+                data_rows = [{"name": str(name), "source": str(source), "digest": str(digest)}]
+
+            for row in data_rows:
+                row.setdefault("name", str(name))
+                row.setdefault("source", str(source))
+                row.setdefault("digest", str(digest))
+                for key, value in dict(metadata or {}).items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        row.setdefault(str(key), value)
+
+            ds = from_pandas(pd.DataFrame(data_rows), source=str(source), name=str(name))
             log_input(ds, context=str(context))
         except Exception as exc:
             logger.warning("mlflow.log_input failed for dataset '%s': %s", name, exc)
@@ -190,3 +201,16 @@ class MLflowTracker:
         p = Path(path)
         if p.exists():
             mlflow.log_artifact(str(p), artifact_path=artifact_path)
+
+    def log_torch_model(self, model: Any, artifact_path: str = "model") -> None:
+        if not self.enabled or mlflow is None:
+            return
+        try:
+            mlflow_pytorch = getattr(mlflow, "pytorch", None)
+            log_model = getattr(mlflow_pytorch, "log_model", None) if mlflow_pytorch is not None else None
+            if log_model is None:
+                logger.warning("mlflow.pytorch.log_model unavailable; skipping model logging")
+                return
+            log_model(model, artifact_path=artifact_path)
+        except Exception as exc:
+            logger.warning("mlflow.pytorch.log_model failed for '%s': %s", artifact_path, exc)
