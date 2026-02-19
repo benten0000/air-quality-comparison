@@ -543,14 +543,14 @@ def run_approach(
         )
 
     def payload_for(stations_in: list[str], key: str) -> tuple[np.ndarray, np.ndarray]:
-        sid = _cat(
-            [sid_geo(st, len(splits[st][key]))[0] for st in stations_in],
-            empty=np.empty((0,), dtype=np.int64),
-        )
-        geo = _cat(
-            [sid_geo(st, len(splits[st][key]))[1] for st in stations_in],
-            empty=np.empty((0, 2), dtype=np.float32),
-        )
+        sid_parts: list[np.ndarray] = []
+        geo_parts: list[np.ndarray] = []
+        for st in stations_in:
+            sid_arr, geo_arr = sid_geo(st, len(splits[st][key]))
+            sid_parts.append(sid_arr)
+            geo_parts.append(geo_arr)
+        sid = _cat(sid_parts, empty=np.empty((0,), dtype=np.int64))
+        geo = _cat(geo_parts, empty=np.empty((0, 2), dtype=np.float32))
         return sid, geo
 
     x_train = np.concatenate([splits[st]["x_train"] for st in stations], axis=0)

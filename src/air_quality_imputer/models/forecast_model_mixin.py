@@ -23,6 +23,28 @@ class ForecastModelMixin:
             raise ValueError(f"{name} contains NaN/Inf; preprocess data before training/inference")
 
     @staticmethod
+    def _assert_finite_array(array: np.ndarray, name: str) -> None:
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contains NaN/Inf; preprocess data before training/inference")
+
+    @staticmethod
+    def _mask_key(batch: torch.Tensor) -> tuple[tuple[int, ...], torch.dtype, str]:
+        return (tuple(batch.shape), batch.dtype, str(batch.device))
+
+    @classmethod
+    def _input_mask(
+        cls,
+        batch: torch.Tensor,
+        cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor],
+    ) -> torch.Tensor:
+        key = cls._mask_key(batch)
+        mask = cache.get(key)
+        if mask is None:
+            mask = torch.ones_like(batch)
+            cache[key] = mask
+        return mask
+
+    @staticmethod
     def _set_seed(seed: int) -> None:
         random.seed(seed)
         np.random.seed(seed)
@@ -102,14 +124,14 @@ class ForecastModelMixin:
         amp: bool,
     ) -> np.ndarray:
         out: list[np.ndarray] = []
+        mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
         model.eval()
         with torch.no_grad():
             for bx, _, sid, geo in data_loader:
                 bx = bx.to(device, non_blocking=amp)
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
-                ForecastModelMixin._assert_finite(bx, "predict.x")
-                input_mask = torch.ones_like(bx)
+                input_mask = ForecastModelMixin._input_mask(bx, mask_cache)
                 pred_all = model(bx, input_mask, station_ids=sid, station_geo=geo)
                 pred = pred_all.index_select(1, target_idx_tensor)
                 out.append(pred.detach().cpu().numpy())
@@ -127,6 +149,7 @@ class ForecastModelMixin:
     ) -> float:
         criterion = nn.MSELoss()
         total, n_batches = 0.0, 0
+        mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
         model.eval()
         with torch.no_grad():
             for bx, by, sid, geo in data_loader:
@@ -134,9 +157,7 @@ class ForecastModelMixin:
                 by = by.to(device, non_blocking=amp)
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
-                ForecastModelMixin._assert_finite(bx, "eval.x")
-                ForecastModelMixin._assert_finite(by, "eval.y")
-                input_mask = torch.ones_like(bx)
+                input_mask = ForecastModelMixin._input_mask(bx, mask_cache)
                 pred_all = model(bx, input_mask, station_ids=sid, station_geo=geo)
                 pred = pred_all.index_select(1, target_idx_tensor)
                 total += float(criterion(pred, by).item())
@@ -161,6 +182,11 @@ class ForecastModelMixin:
     ) -> float:
         if len(x_train) == 0:
             raise ValueError("Training set is empty")
+        self._assert_finite_array(x_train, "train.x")
+        self._assert_finite_array(y_train, "train.y")
+        if len(x_val) > 0:
+            self._assert_finite_array(x_val, "val.x")
+            self._assert_finite_array(y_val, "val.y")
 
         module_self = cast(nn.Module, self)
         self._set_seed(seed)
@@ -230,6 +256,7 @@ class ForecastModelMixin:
         best_epoch = 0
         patience_counter = 0
         best_state: dict[str, torch.Tensor] | None = None
+        mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
         start = time.perf_counter()
 
         for epoch in range(1, int(training_cfg.epochs) + 1):
@@ -241,9 +268,7 @@ class ForecastModelMixin:
                 sid = sid.to(device, non_blocking=amp)
                 geo = geo.to(device, non_blocking=amp)
 
-                self._assert_finite(bx, "train.x")
-                self._assert_finite(by, "train.y")
-                input_mask = torch.ones_like(bx)
+                input_mask = self._input_mask(bx, mask_cache)
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp):
@@ -304,6 +329,7 @@ class ForecastModelMixin:
     ) -> np.ndarray:
         if len(x) == 0:
             return np.empty((0, len(target_indices)), dtype=np.float32)
+        self._assert_finite_array(x, "predict.x")
         module_self = cast(nn.Module, self)
         module_self.to(device)
         amp = device.type == "cuda"

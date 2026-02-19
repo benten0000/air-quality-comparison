@@ -48,6 +48,12 @@ def build_forecast_dataloader(
     pin_memory: bool = True,
     shuffle: bool = True,
 ) -> DataLoader:
+    # Eval/predict loaders are often created repeatedly in loops. Keeping them
+    # single-process avoids excessive worker churn and open file descriptors.
+    if not shuffle:
+        num_workers = 0
+        persistent_workers = False
+
     if num_workers < 0:
         cpu_count = os.cpu_count() or 1
         num_workers = max(1, min(8, ceil(cpu_count / 2)))
