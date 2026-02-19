@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -139,6 +140,49 @@ class MLflowTracker:
         if not payload:
             return
         mlflow.log_metrics(payload) if step is None else mlflow.log_metrics(payload, step=step)
+
+    def log_dict(self, payload: Mapping[str, Any], artifact_file: str, artifact_path: str | None = None) -> None:
+        if not self.enabled or mlflow is None:
+            return
+        try:
+            rel_path = artifact_file.strip("/")
+            if artifact_path:
+                rel_path = f"{artifact_path.strip('/')}/{rel_path}"
+            if hasattr(mlflow, "log_dict"):
+                mlflow.log_dict(dict(payload), rel_path)
+                return
+            logger.warning("mlflow.log_dict unavailable; skipping dict artifact '%s'", rel_path)
+        except Exception as exc:
+            logger.warning("mlflow.log_dict failed for '%s': %s", artifact_file, exc)
+
+    def log_dataset_input(
+        self,
+        *,
+        name: str,
+        source: str,
+        digest: str,
+        context: str = "training",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled or mlflow is None:
+            return
+        try:
+            data_module = getattr(mlflow, "data", None)
+            from_pandas = getattr(data_module, "from_pandas", None) if data_module is not None else None
+            log_input = getattr(mlflow, "log_input", None)
+            if from_pandas is None or log_input is None:
+                logger.warning("mlflow dataset input API unavailable; skipping dataset input logging")
+                return
+
+            import pandas as pd
+
+            row: dict[str, str] = {"name": str(name), "source": str(source), "digest": str(digest)}
+            for key, value in dict(metadata or {}).items():
+                row[str(key)] = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+            ds = from_pandas(pd.DataFrame([row]), source=str(source), name=str(name))
+            log_input(ds, context=str(context))
+        except Exception as exc:
+            logger.warning("mlflow.log_input failed for dataset '%s': %s", name, exc)
 
     def log_artifact(self, path: Path | str, artifact_path: str | None = None) -> None:
         if not self.enabled or mlflow is None:

@@ -925,8 +925,42 @@ def run_scenario(
                     manifest_dir
                     / f"dataset_manifest_{source_name}_{scenario_name}_fold{int(fold_id):02d}_{approach}.json"
                 )
-                manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+                manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
+                manifest_path.write_text(manifest_json, encoding="utf-8")
+                dataset_manifest_sha1 = hashlib.sha1(manifest_json.encode("utf-8")).hexdigest()
+                tracker.log_params({"manifest_sha1": dataset_manifest_sha1}, prefix="dataset")
                 tracker.log_artifact(manifest_path, artifact_path="dataset")
+                tracker.log_dataset_input(
+                    name=f"{source_name}:{scenario_name}:fold{int(fold_id):02d}",
+                    source=str(cfg.data.data_dir),
+                    digest=dataset_manifest_sha1,
+                    context="training",
+                    metadata={
+                        "n_sources": len(sources_used),
+                        "n_stations": len(stations),
+                        "model_kind": str(model_kind),
+                        "approach_kind": str(approach_kind),
+                    },
+                )
+                model_manifest: dict[str, Any] = {
+                    "model_kind": str(model_kind),
+                    "approach": str(approach),
+                    "approach_kind": str(approach_kind),
+                    "runtime": to_plain_dict(model_runtime_cfg(cfg, model_kind)),
+                    "params": to_plain_dict(cfg.models[model_kind].params),
+                    "features": list(cfg.data.features),
+                    "target_features": list(cfg.data.target_features),
+                    "save_models": bool(cfg.output.save_models),
+                }
+                tracker.log_dict(model_manifest, artifact_file="model_manifest.json", artifact_path="model")
+                tracker.log_params(
+                    {
+                        "kind": str(model_kind),
+                        "approach": str(approach_kind),
+                        "artifacts_saved": bool(cfg.output.save_models),
+                    },
+                    prefix="model",
+                )
                 if approach_kind == "global":
                     summary, rows = run_approach(
                         source_name,
