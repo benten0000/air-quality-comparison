@@ -247,7 +247,7 @@ class ForecastModelMixin:
                 with torch.autocast(device_type=x.device.type, enabled=amp_dtype is not None, dtype=amp_dtype):
                     pred_all = model(bx, input_mask, station_ids=bsid, station_geo=bgeo)
                     pred = pred_all.index_select(1, target_idx_tensor)
-                out.append(pred.detach().cpu().numpy())
+                out.append(pred.detach().float().cpu().numpy())
         if not out:
             return np.empty((0, int(target_idx_tensor.numel())), dtype=np.float32)
         return np.concatenate(out, axis=0).astype(np.float32)
@@ -273,7 +273,7 @@ class ForecastModelMixin:
                 with torch.autocast(device_type=device.type, enabled=amp_dtype is not None, dtype=amp_dtype):
                     pred_all = model(bx, input_mask, station_ids=sid, station_geo=geo)
                     pred = pred_all.index_select(1, target_idx_tensor)
-                out.append(pred.detach().cpu().numpy())
+                out.append(pred.detach().float().cpu().numpy())
         if not out:
             return np.empty((0, int(target_idx_tensor.numel())), dtype=np.float32)
         return np.concatenate(out, axis=0).astype(np.float32)
