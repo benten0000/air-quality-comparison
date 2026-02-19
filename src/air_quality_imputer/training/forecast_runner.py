@@ -7,7 +7,7 @@ import os
 import random
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping, Literal, cast
+from typing import Any, Mapping, Literal, TypedDict, cast
 
 import numpy as np
 import pandas as pd
@@ -74,6 +74,44 @@ def _cat(arrs: list[np.ndarray], *, empty: np.ndarray) -> np.ndarray:
     return np.concatenate(arrs, axis=0) if arrs else empty
 
 
+class SplitSet(TypedDict):
+    x_train: np.ndarray
+    y_train: np.ndarray
+    x_val: np.ndarray
+    y_val: np.ndarray
+    x_test: np.ndarray
+    y_test: np.ndarray
+
+
+class PerStationData(TypedDict):
+    scaler: StandardScaler
+    splits: SplitSet
+    sid_train: np.ndarray
+    geo_train: np.ndarray
+    sid_val: np.ndarray
+    geo_val: np.ndarray
+    sid_test: np.ndarray
+    geo_test: np.ndarray
+
+
+class GlobalPrepared(TypedDict):
+    stations: list[str]
+    scaler: StandardScaler
+    x_train: np.ndarray
+    y_train: np.ndarray
+    sid_train: np.ndarray
+    geo_train: np.ndarray
+    x_val: np.ndarray
+    y_val: np.ndarray
+    sid_val: np.ndarray
+    geo_val: np.ndarray
+    x_test: np.ndarray
+    y_test_scaled: np.ndarray
+    sid_test: np.ndarray
+    geo_test: np.ndarray
+    test_counts: list[int]
+
+
 def to_plain_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -135,7 +173,7 @@ def metrics(
 
     abs_true = np.abs(y_true)
     valid_mape = abs_true > float(mape_eps)
-    if np.any(valid_mape):
+    if bool(valid_mape.any()):
         denom_used = np.maximum(abs_true[valid_mape], float(max(mape_min_abs_target, 0.0)))
         mape = float(np.mean(np.abs(err[valid_mape]) / denom_used) * 100.0)
     else:
@@ -145,7 +183,7 @@ def metrics(
     valid_smape = denom_smape > float(mape_eps)
     smape = (
         float(np.mean((2.0 * np.abs(err[valid_smape])) / denom_smape[valid_smape]) * 100.0)
-        if np.any(valid_smape)
+        if bool(valid_smape.any())
         else float("nan")
     )
 
@@ -317,7 +355,8 @@ def build_split(
     val_end: pd.Timestamp,
     eval_start: pd.Timestamp,
 ) -> dict[str, np.ndarray]:
-    times = pd.to_datetime(frame[datetime_col]).to_numpy(dtype="datetime64[ns]")
+    # load_frames already coerces datetime_col; avoid repeated pd.to_datetime overhead.
+    times = frame[datetime_col].to_numpy(dtype="datetime64[ns]")
     scaled = scaler.transform(frame[features].to_numpy(dtype=np.float32)).astype(np.float32)
 
     train_mask = (times >= np.datetime64(train_start)) & (times < np.datetime64(train_end))
@@ -350,6 +389,192 @@ def build_split(
         "x_test": x_all[eval_mask],
         "y_test": y_all[eval_mask],
     }
+
+
+def prepare_global_data(
+    *,
+    frames: dict[str, pd.DataFrame],
+    train_starts: dict[str, pd.Timestamp],
+    train_end: pd.Timestamp,
+    val_end: pd.Timestamp,
+    eval_start: pd.Timestamp,
+    cfg: DictConfig,
+    station_to_id: dict[str, int],
+    station_geo_map: dict[str, np.ndarray],
+) -> GlobalPrepared:
+    features = list(cfg.data.features)
+    target_features = list(cfg.data.target_features)
+    target_idx = [features.index(f) for f in target_features]
+    history_length = int(cfg.experiment.common.history_length)
+    datetime_col = str(cfg.data.datetime_col)
+    horizon = int(cfg.experiment.common.forecast_horizon)
+    step_size = int(cfg.experiment.common.step_size)
+    stations = sorted(frames)
+
+    scaler = fit_global_scaler(frames, datetime_col, features, train_starts, train_end)
+    splits: dict[str, SplitSet] = {}
+    for st in stations:
+        splits[st] = cast(
+            SplitSet,
+            build_split(
+                frames[st],
+                datetime_col,
+                features,
+                target_idx,
+                scaler,
+                history_length,
+                horizon,
+                step_size,
+                train_starts[st],
+                train_end,
+                val_end,
+                eval_start,
+            ),
+        )
+        if len(splits[st]["x_train"]) == 0:
+            raise ValueError(f"global: station {st} has no training samples")
+        if len(splits[st]["x_test"]) == 0:
+            raise ValueError(f"global: station {st} has no evaluation samples")
+
+    def sid_geo(station: str, n: int) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.full((n,), station_to_id[station], dtype=np.int64),
+            np.repeat(station_geo_map[station][None, :], n, axis=0).astype(np.float32, copy=False),
+        )
+
+    def payload_for(stations_in: list[str], key: str) -> tuple[np.ndarray, np.ndarray]:
+        sid_parts: list[np.ndarray] = []
+        geo_parts: list[np.ndarray] = []
+        for st in stations_in:
+            sid_arr, geo_arr = sid_geo(st, len(splits[st][key]))
+            sid_parts.append(sid_arr)
+            geo_parts.append(geo_arr)
+        sid = _cat(sid_parts, empty=np.empty((0,), dtype=np.int64))
+        geo = _cat(geo_parts, empty=np.empty((0, 2), dtype=np.float32))
+        return sid, geo
+
+    x_train = np.concatenate([splits[st]["x_train"] for st in stations], axis=0)
+    y_train = np.concatenate([splits[st]["y_train"] for st in stations], axis=0)
+    sid_train, geo_train = payload_for(stations, "x_train")
+
+    val_stations = [st for st in stations if len(splits[st]["x_val"]) > 0]
+    x_val = _cat(
+        [splits[st]["x_val"] for st in val_stations],
+        empty=np.empty((0, history_length, len(features)), dtype=np.float32),
+    )
+    y_val = _cat(
+        [splits[st]["y_val"] for st in val_stations],
+        empty=np.empty((0, len(target_features)), dtype=np.float32),
+    )
+    sid_val, geo_val = payload_for(val_stations, "x_val") if val_stations else (
+        np.empty((0,), dtype=np.int64),
+        np.empty((0, 2), dtype=np.float32),
+    )
+
+    x_test_all = _cat(
+        [splits[st]["x_test"] for st in stations],
+        empty=np.empty((0, history_length, len(features)), dtype=np.float32),
+    )
+    y_test_scaled_all = _cat(
+        [splits[st]["y_test"] for st in stations],
+        empty=np.empty((0, len(target_features)), dtype=np.float32),
+    )
+    sid_test, geo_test = payload_for(stations, "x_test")
+    test_counts = [int(len(splits[st]["x_test"])) for st in stations]
+
+    return {
+        "stations": stations,
+        "scaler": scaler,
+        "x_train": x_train,
+        "y_train": y_train,
+        "sid_train": sid_train,
+        "geo_train": geo_train,
+        "x_val": x_val,
+        "y_val": y_val,
+        "sid_val": sid_val,
+        "geo_val": geo_val,
+        "x_test": x_test_all,
+        "y_test_scaled": y_test_scaled_all,
+        "sid_test": sid_test,
+        "geo_test": geo_test,
+        "test_counts": test_counts,
+    }
+
+
+def prepare_per_station_data(
+    *,
+    frames: dict[str, pd.DataFrame],
+    train_starts: dict[str, pd.Timestamp],
+    train_end: pd.Timestamp,
+    val_end: pd.Timestamp,
+    eval_start: pd.Timestamp,
+    cfg: DictConfig,
+    station_geo_map: dict[str, np.ndarray],
+) -> dict[str, PerStationData]:
+    features = list(cfg.data.features)
+    target_features = list(cfg.data.target_features)
+    target_idx = [features.index(f) for f in target_features]
+    history_length = int(cfg.experiment.common.history_length)
+    datetime_col = str(cfg.data.datetime_col)
+    horizon = int(cfg.experiment.common.forecast_horizon)
+    step_size = int(cfg.experiment.common.step_size)
+    stations = sorted(frames)
+
+    out: dict[str, PerStationData] = {}
+    for st in stations:
+        frame = frames[st]
+        train_mask = (frame[datetime_col] >= train_starts[st]) & (frame[datetime_col] < train_end)
+        train_arr = frame.loc[train_mask, features].to_numpy(dtype=np.float32)
+        if train_arr.size == 0:
+            raise ValueError(f"per_station: station {st} has no training rows for scaler")
+        scaler = StandardScaler()
+        scaler.fit(train_arr)
+
+        splits = cast(
+            SplitSet,
+            build_split(
+                frame,
+                datetime_col,
+                features,
+                target_idx,
+                scaler,
+                history_length,
+                horizon,
+                step_size,
+                train_starts[st],
+                train_end,
+                val_end,
+                eval_start,
+            ),
+        )
+        if len(splits["x_train"]) == 0:
+            raise ValueError(f"per_station: station {st} has no training samples")
+        if len(splits["x_test"]) == 0:
+            raise ValueError(f"per_station: station {st} has no evaluation samples")
+
+        sid_train = np.zeros((len(splits["x_train"]),), dtype=np.int64)
+        geo_train = np.repeat(station_geo_map[st][None, :], len(splits["x_train"]), axis=0).astype(np.float32, copy=False)
+        if len(splits["x_val"]) > 0:
+            sid_val = np.zeros((len(splits["x_val"]),), dtype=np.int64)
+            geo_val = np.repeat(station_geo_map[st][None, :], len(splits["x_val"]), axis=0).astype(np.float32, copy=False)
+        else:
+            sid_val = np.empty((0,), dtype=np.int64)
+            geo_val = np.empty((0, 2), dtype=np.float32)
+
+        sid_test = np.zeros((len(splits["x_test"]),), dtype=np.int64)
+        geo_test = np.repeat(station_geo_map[st][None, :], len(splits["x_test"]), axis=0).astype(np.float32, copy=False)
+
+        out[st] = {
+            "scaler": scaler,
+            "splits": splits,
+            "sid_train": sid_train,
+            "geo_train": geo_train,
+            "sid_val": sid_val,
+            "geo_val": geo_val,
+            "sid_test": sid_test,
+            "geo_test": geo_test,
+        }
+    return out
 
 
 def inverse_scale_targets(y_scaled: np.ndarray, scaler: StandardScaler, target_indices: list[int]) -> np.ndarray:
@@ -499,6 +724,7 @@ def run_approach(
     fold_id: int,
     tracker: MLflowTracker | None = None,
     model_artifact_path: str = "model",
+    prepared: GlobalPrepared | None = None,
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -508,75 +734,36 @@ def run_approach(
     history_length = int(cfg.experiment.common.history_length)
     mape_eps = float(OmegaConf.select(cfg, "metrics.mape_eps", default=1e-6))
     mape_min_abs_target = float(OmegaConf.select(cfg, "metrics.mape_min_abs_target", default=0.0))
-    stations = sorted(frames)
+    if prepared is None:
+        prepared = prepare_global_data(
+            frames=frames,
+            train_starts=train_starts,
+            train_end=train_end,
+            val_end=val_end,
+            eval_start=eval_start,
+            cfg=cfg,
+            station_to_id=station_to_id,
+            station_geo_map=station_geo_map,
+        )
+
+    stations = prepared["stations"]
+    scaler = prepared["scaler"]
+    x_train = prepared["x_train"]
+    y_train = prepared["y_train"]
+    sid_train = prepared["sid_train"]
+    geo_train = prepared["geo_train"]
+    x_val = prepared["x_val"]
+    y_val = prepared["y_val"]
+    sid_val = prepared["sid_val"]
+    geo_val = prepared["geo_val"]
+    x_test_all = prepared["x_test"]
+    y_test_scaled_all = prepared["y_test_scaled"]
+    sid_test_all = prepared["sid_test"]
+    geo_test_all = prepared["geo_test"]
+    test_counts = prepared["test_counts"]
+
     dev = device_from_cfg(str(training_cfg.device))
-
-    datetime_col = str(cfg.data.datetime_col)
-    horizon = int(cfg.experiment.common.forecast_horizon)
-    step_size = int(cfg.experiment.common.step_size)
     runtime_cfg = model_runtime_cfg(cfg, model_kind)
-
-    scaler = fit_global_scaler(frames, datetime_col, features, train_starts, train_end)
-    scalers = {st: scaler for st in stations}
-
-    splits: dict[str, dict[str, np.ndarray]] = {}
-    for st in stations:
-        splits[st] = build_split(
-            frames[st],
-            datetime_col,
-            features,
-            target_idx,
-            scalers[st],
-            history_length,
-            horizon,
-            step_size,
-            train_starts[st],
-            train_end,
-            val_end,
-            eval_start,
-        )
-
-    for st in stations:
-        sp = splits[st]
-        if len(sp["x_train"]) == 0:
-            raise ValueError(f"{approach}: station {st} has no training samples")
-        if len(sp["x_test"]) == 0:
-            raise ValueError(f"{approach}: station {st} has no evaluation samples")
-
-    def sid_geo(station: str, n: int) -> tuple[np.ndarray, np.ndarray]:
-        return (
-            np.full((n,), station_to_id[station], dtype=np.int64),
-            np.repeat(station_geo_map[station][None, :], n, axis=0).astype(np.float32, copy=False),
-        )
-
-    def payload_for(stations_in: list[str], key: str) -> tuple[np.ndarray, np.ndarray]:
-        sid_parts: list[np.ndarray] = []
-        geo_parts: list[np.ndarray] = []
-        for st in stations_in:
-            sid_arr, geo_arr = sid_geo(st, len(splits[st][key]))
-            sid_parts.append(sid_arr)
-            geo_parts.append(geo_arr)
-        sid = _cat(sid_parts, empty=np.empty((0,), dtype=np.int64))
-        geo = _cat(geo_parts, empty=np.empty((0, 2), dtype=np.float32))
-        return sid, geo
-
-    x_train = np.concatenate([splits[st]["x_train"] for st in stations], axis=0)
-    y_train = np.concatenate([splits[st]["y_train"] for st in stations], axis=0)
-    sid_train, geo_train = payload_for(stations, "x_train")
-
-    val_stations = [st for st in stations if len(splits[st]["x_val"]) > 0]
-    x_val = _cat(
-        [splits[st]["x_val"] for st in val_stations],
-        empty=np.empty((0, history_length, len(features)), dtype=np.float32),
-    )
-    y_val = _cat(
-        [splits[st]["y_val"] for st in val_stations],
-        empty=np.empty((0, len(target_features)), dtype=np.float32),
-    )
-    sid_val, geo_val = payload_for(val_stations, "x_val") if val_stations else (
-        np.empty((0,), dtype=np.int64),
-        np.empty((0, 2), dtype=np.float32),
-    )
 
     model = build_model(
         cfg,
@@ -607,19 +794,6 @@ def run_approach(
     station_rows: list[dict[str, float | int | str]] = []
 
     # Predict all stations in one go to reduce Python/DataLoader overhead and keep GPU utilization high.
-    test_counts: list[int] = []
-    x_test_all = _cat(
-        [splits[st]["x_test"] for st in stations],
-        empty=np.empty((0, history_length, len(features)), dtype=np.float32),
-    )
-    y_test_scaled_all = _cat(
-        [splits[st]["y_test"] for st in stations],
-        empty=np.empty((0, len(target_features)), dtype=np.float32),
-    )
-    sid_test_all, geo_test_all = payload_for(stations, "x_test")
-    for st in stations:
-        test_counts.append(int(len(splits[st]["x_test"])))
-
     pred_scaled_all = predict_model(
         model,
         x=x_test_all,
@@ -658,7 +832,7 @@ def run_approach(
             model_kind,
             features,
             target_features,
-            scalers[stations[0]],
+            scaler,
         )
 
     all_true_arr = y_true_all
@@ -691,11 +865,13 @@ def run_approach_per_station(
     train_end: pd.Timestamp,
     val_end: pd.Timestamp,
     eval_start: pd.Timestamp,
+    station_geo_map: dict[str, np.ndarray],
     cfg: DictConfig,
     training_cfg: DictConfig,
     fold_id: int,
     tracker: MLflowTracker | None = None,
     model_artifact_path_prefix: str = "model",
+    prepared: dict[str, PerStationData] | None = None,
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -719,57 +895,43 @@ def run_approach_per_station(
     runtime_cfg_per_station.dataloader_persistent_workers = False
     runtime_cfg_per_station.dataloader_pin_memory = False
 
-    station_geo_map = load_station_geo_vectors(cfg, stations)
+    if prepared is None:
+        prepared = prepare_per_station_data(
+            frames=frames,
+            train_starts=train_starts,
+            train_end=train_end,
+            val_end=val_end,
+            eval_start=eval_start,
+            cfg=cfg,
+            station_geo_map=station_geo_map,
+        )
     station_rows: list[dict[str, float | int | str]] = []
     all_true, all_pred = [], []
     total_time = 0.0
 
+    per_station = prepared
+
+    # Reuse a single model instance across stations (reset weights) to avoid rebuild/compile overhead.
+    model = build_model(
+        cfg,
+        model_kind,
+        runtime_cfg_per_station,
+        len(features),
+        n_stations=1,
+        station_feature_index=station_feature_index,
+    )
+    # Move once so resets are device-to-device copies (avoids repeated CPU->GPU transfers per station).
+    model.to(dev)
+    init_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
     for idx, st in enumerate(stations):
-        # Classic baseline: everything (including scaling) is fitted on that station's training slice only.
-        frame = frames[st]
-        train_mask = (frame[datetime_col] >= train_starts[st]) & (frame[datetime_col] < train_end)
-        train_arr = frame.loc[train_mask, features].to_numpy(dtype=np.float32)
-        if train_arr.size == 0:
-            raise ValueError(f"{approach}: station {st} has no training rows for scaler")
-        scaler = StandardScaler()
-        scaler.fit(train_arr)
-
-        splits = build_split(
-            frame,
-            datetime_col,
-            features,
-            target_idx,
-            scaler,
-            history_length,
-            horizon,
-            step_size,
-            train_starts[st],
-            train_end,
-            val_end,
-            eval_start,
-        )
-        if len(splits["x_train"]) == 0:
-            raise ValueError(f"{approach}: station {st} has no training samples")
-        if len(splits["x_test"]) == 0:
-            raise ValueError(f"{approach}: station {st} has no evaluation samples")
-
-        model = build_model(
-            cfg,
-            model_kind,
-            runtime_cfg_per_station,
-            len(features),
-            n_stations=1,
-            station_feature_index=station_feature_index,
-        )
-
-        sid_train = np.zeros((len(splits["x_train"]),), dtype=np.int64)
-        geo_train = np.repeat(station_geo_map[st][None, :], len(splits["x_train"]), axis=0).astype(np.float32, copy=False)
-        if len(splits["x_val"]) > 0:
-            sid_val = np.zeros((len(splits["x_val"]),), dtype=np.int64)
-            geo_val = np.repeat(station_geo_map[st][None, :], len(splits["x_val"]), axis=0).astype(np.float32, copy=False)
-        else:
-            sid_val = np.empty((0,), dtype=np.int64)
-            geo_val = np.empty((0, 2), dtype=np.float32)
+        model.load_state_dict(init_state)
+        scaler = per_station[st]["scaler"]
+        splits = per_station[st]["splits"]
+        sid_train = per_station[st]["sid_train"]
+        geo_train = per_station[st]["geo_train"]
+        sid_val = per_station[st]["sid_val"]
+        geo_val = per_station[st]["geo_val"]
 
         total_time += fit_model(
             model,
@@ -789,8 +951,8 @@ def run_approach_per_station(
         if tracker is not None:
             tracker.log_torch_model(model, artifact_path=f"{model_artifact_path_prefix}__{_slug(st)}")
 
-        sid_test = np.zeros((len(splits["x_test"]),), dtype=np.int64)
-        geo_test = np.repeat(station_geo_map[st][None, :], len(splits["x_test"]), axis=0).astype(np.float32, copy=False)
+        sid_test = per_station[st]["sid_test"]
+        geo_test = per_station[st]["geo_test"]
         pred_scaled = predict_model(
             model,
             x=splits["x_test"],
@@ -872,8 +1034,7 @@ def run_scenario(
     print(f"[INFO] Models: {', '.join(model_kinds)}")
 
     reports_dir = Path(str(cfg.paths.reports_dir))
-    manifest_dir = reports_dir / "mlflow_manifests"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {
         "data_source": source_name,
@@ -881,8 +1042,86 @@ def run_scenario(
         "reduced_station_count": len(reduced_stations),
         "reduced_stations": ",".join(reduced_stations),
     }
+
+    stations_key = ",".join(stations).encode("utf-8")
+    sources_key = ",".join(sources_used).encode("utf-8")
+    reduced_key = ",".join(reduced_stations).encode("utf-8")
+    missing_months = int(OmegaConf.select(cfg, "experiment.five_fold.missing_months", default=0))
+
+    time_range_by_station = {
+        st: {
+            "min": str(frames[st][str(cfg.data.datetime_col)].min()),
+            "max": str(frames[st][str(cfg.data.datetime_col)].max()),
+        }
+        for st in stations
+    }
+
+    dataset_name = f"{source_name}:{scenario_name}:fold{int(fold_id):02d}"
+    dataset_manifest = {
+        "data_source": source_name,
+        "sources_used": list(sources_used),
+        "scenario": scenario_name,
+        "fold": int(fold_id),
+        "datetime_col": str(cfg.data.datetime_col),
+        "features": list(cfg.data.features),
+        "target_features": list(cfg.data.target_features),
+        "stations": list(stations),
+        "time_range_by_station": time_range_by_station,
+        "train_start_by_station": {st: str(train_starts[st]) for st in stations},
+        "train_end": str(train_end),
+        "val_end": str(val_end),
+        "test_start": str(eval_start),
+        "missing_months": missing_months,
+        "reduced_stations": list(reduced_stations),
+    }
+    dataset_manifest_json = json.dumps(dataset_manifest, indent=2, sort_keys=True)
+    dataset_manifest_sha1 = hashlib.sha1(dataset_manifest_json.encode("utf-8")).hexdigest()
+
+    reduced_set = set(reduced_stations)
+    dataset_rows = cast(
+        list[Mapping[str, Any]],
+        [
+            {
+                "station": str(st),
+                "fold": int(fold_id),
+                "source_name": str(source_name),
+                "scenario": str(scenario_name),
+                "is_reduced": st in reduced_set,
+                "n_rows": int(len(frames[st])),
+                "train_start": str(train_starts[st]),
+                "train_end": str(train_end),
+                "val_end": str(val_end),
+                "test_start": str(eval_start),
+                "time_min": str(frames[st][str(cfg.data.datetime_col)].min()),
+                "time_max": str(frames[st][str(cfg.data.datetime_col)].max()),
+            }
+            for st in stations
+        ],
+    )
     summary_rows: list[dict[str, float | int | str]] = []
     station_rows: list[dict[str, float | int | str]] = []
+
+    # Prepare dataset splits once per scenario+fold and reuse across all model runs.
+    # This removes repeated scaler fitting + windowing work between models.
+    global_prepared = prepare_global_data(
+        frames=frames,
+        train_starts=train_starts,
+        train_end=train_end,
+        val_end=val_end,
+        eval_start=eval_start,
+        cfg=cfg,
+        station_to_id=station_to_id,
+        station_geo_map=station_geo_map,
+    )
+    per_station_prepared = prepare_per_station_data(
+        frames=frames,
+        train_starts=train_starts,
+        train_end=train_end,
+        val_end=val_end,
+        eval_start=eval_start,
+        cfg=cfg,
+        station_geo_map=station_geo_map,
+    )
     for model_kind in model_kinds:
         for approach_kind in ("global", "per_station"):
             approach = f"{model_kind}__{approach_kind}"
@@ -914,10 +1153,6 @@ def run_scenario(
                 tracker.log_params(to_plain_dict(model_runtime_cfg(cfg, model_kind)), prefix=f"models.{model_kind}.runtime")
                 tracker.log_params(to_plain_dict(cfg.models[model_kind].params), prefix=f"models.{model_kind}")
 
-                stations_key = ",".join(stations).encode("utf-8")
-                sources_key = ",".join(sources_used).encode("utf-8")
-                reduced_key = ",".join(reduced_stations).encode("utf-8")
-                missing_months = int(OmegaConf.select(cfg, "experiment.five_fold.missing_months", default=0))
                 tracker.log_params(
                     {
                         "n_sources": len(sources_used),
@@ -934,64 +1169,10 @@ def run_scenario(
                     prefix="dataset",
                 )
 
-                time_range_by_station = {
-                    st: {
-                        "min": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].min())),
-                        "max": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].max())),
-                    }
-                    for st in stations
-                }
-                manifest = {
-                    "data_source": source_name,
-                    "sources_used": list(sources_used),
-                    "scenario": scenario_name,
-                    "fold": int(fold_id),
-                    "model_kind": str(model_kind),
-                    "approach": str(approach),
-                    "approach_kind": str(approach_kind),
-                    "datetime_col": str(cfg.data.datetime_col),
-                    "features": list(cfg.data.features),
-                    "target_features": list(cfg.data.target_features),
-                    "stations": list(stations),
-                    "time_range_by_station": time_range_by_station,
-                    "train_start_by_station": {st: str(train_starts[st]) for st in stations},
-                    "train_end": str(train_end),
-                    "val_end": str(val_end),
-                    "test_start": str(eval_start),
-                    "missing_months": missing_months,
-                    "reduced_stations": list(reduced_stations),
-                }
-                manifest_path = (
-                    manifest_dir
-                    / f"dataset_manifest_{source_name}_{scenario_name}_fold{int(fold_id):02d}_{approach}.json"
-                )
-                manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
-                manifest_path.write_text(manifest_json, encoding="utf-8")
-                dataset_manifest_sha1 = hashlib.sha1(manifest_json.encode("utf-8")).hexdigest()
                 tracker.log_params({"manifest_sha1": dataset_manifest_sha1}, prefix="dataset")
-                tracker.log_artifact(manifest_path, artifact_path="dataset")
-                reduced_set = set(reduced_stations)
-                dataset_rows = [
-                    {
-                        "station": str(st),
-                        "fold": int(fold_id),
-                        "source_name": str(source_name),
-                        "scenario": str(scenario_name),
-                        "model_kind": str(model_kind),
-                        "approach_kind": str(approach_kind),
-                        "is_reduced": st in reduced_set,
-                        "n_rows": int(len(frames[st])),
-                        "train_start": str(train_starts[st]),
-                        "train_end": str(train_end),
-                        "val_end": str(val_end),
-                        "test_start": str(eval_start),
-                        "time_min": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].min())),
-                        "time_max": str(pd.to_datetime(frames[st][str(cfg.data.datetime_col)].max())),
-                    }
-                    for st in stations
-                ]
+                tracker.log_dict(dataset_manifest, artifact_file="dataset_manifest.json", artifact_path="dataset")
                 tracker.log_dataset_input(
-                    name=f"{source_name}:{scenario_name}:fold{int(fold_id):02d}:{model_kind}:{approach_kind}",
+                    name=dataset_name,
                     source=str(cfg.data.data_dir),
                     digest=dataset_manifest_sha1,
                     context="training",
@@ -999,8 +1180,8 @@ def run_scenario(
                     metadata={
                         "n_sources": len(sources_used),
                         "n_stations": len(stations),
-                        "model_kind": str(model_kind),
-                        "approach_kind": str(approach_kind),
+                        "missing_months": missing_months,
+                        "reduced_station_count": len(reduced_stations),
                     },
                 )
                 model_manifest: dict[str, Any] = {
@@ -1044,6 +1225,7 @@ def run_scenario(
                         fold_id,
                         tracker=tracker,
                         model_artifact_path=model_artifact_path,
+                        prepared=global_prepared,
                     )
                 else:
                     summary, rows = run_approach_per_station(
@@ -1055,11 +1237,13 @@ def run_scenario(
                         train_end,
                         val_end,
                         eval_start,
+                        station_geo_map,
                         cfg,
                         training_cfg,
                         fold_id,
                         tracker=tracker,
                         model_artifact_path_prefix=model_artifact_path,
+                        prepared=per_station_prepared,
                     )
 
                 if bool(cfg.output.save_models):

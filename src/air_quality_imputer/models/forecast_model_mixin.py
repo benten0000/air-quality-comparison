@@ -132,6 +132,19 @@ class ForecastModelMixin:
         return x_t, y_t, sid_t, geo_t
 
     @staticmethod
+    def _as_device_inputs(
+        *,
+        x: np.ndarray,
+        station_ids: np.ndarray,
+        station_geo: np.ndarray,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_t = torch.from_numpy(np.asarray(x, dtype=np.float32)).to(device, non_blocking=False)
+        sid_t = torch.from_numpy(np.asarray(station_ids, dtype=np.int64)).to(device, non_blocking=False)
+        geo_t = torch.from_numpy(np.asarray(station_geo, dtype=np.float32)).to(device, non_blocking=False)
+        return x_t, sid_t, geo_t
+
+    @staticmethod
     def _eval_loss_tensors(
         model: nn.Module,
         *,
@@ -147,7 +160,7 @@ class ForecastModelMixin:
         total = torch.zeros((), device=x.device, dtype=torch.float32)
         n_batches = 0
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             n = int(x.shape[0])
             for start in range(0, n, int(batch_size)):
                 end = min(start + int(batch_size), n)
@@ -177,7 +190,7 @@ class ForecastModelMixin:
     ) -> np.ndarray:
         out: list[np.ndarray] = []
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             n = int(x.shape[0])
             for start in range(0, n, int(batch_size)):
                 end = min(start + int(batch_size), n)
@@ -203,7 +216,7 @@ class ForecastModelMixin:
         out: list[np.ndarray] = []
         mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for bx, _, sid, geo in data_loader:
                 bx = bx.to(device, non_blocking=amp)
                 sid = sid.to(device, non_blocking=amp)
@@ -228,7 +241,7 @@ class ForecastModelMixin:
         total, n_batches = 0.0, 0
         mask_cache: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for bx, by, sid, geo in data_loader:
                 bx = bx.to(device, non_blocking=amp)
                 by = by.to(device, non_blocking=amp)
@@ -358,9 +371,16 @@ class ForecastModelMixin:
 
             if device.type == "cuda":
                 n = int(x_train_t.shape[0])
-                perm = torch.randperm(n, device=device)
                 bs = int(training_cfg.batch_size)
-                for start_idx in range(0, n, bs):
+                if bs > n:
+                    bs = n
+                perm = torch.randperm(n, device=device)
+                # Keep batch shapes stable for torch.compile (avoid last smaller batch).
+                remainder = int(perm.numel()) % bs
+                if remainder:
+                    pad = bs - remainder
+                    perm = torch.cat([perm, perm[:pad]], dim=0)
+                for start_idx in range(0, int(perm.numel()), bs):
                     idx = perm[start_idx : start_idx + bs]
                     bx = x_train_t.index_select(0, idx)
                     by = y_train_t.index_select(0, idx)
@@ -468,9 +488,8 @@ class ForecastModelMixin:
         sid, geo = self._station_payload(len(x), station_ids, station_geo)
         target_idx_tensor = torch.as_tensor(target_indices, dtype=torch.long, device=device)
         if device.type == "cuda":
-            x_t, _, sid_t, geo_t = self._as_device_tensors(
+            x_t, sid_t, geo_t = self._as_device_inputs(
                 x=x,
-                y=np.zeros((len(x), len(target_indices)), dtype=np.float32),
                 station_ids=sid,
                 station_geo=geo,
                 device=device,

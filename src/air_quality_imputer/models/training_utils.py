@@ -28,7 +28,16 @@ def maybe_compile_model(model: nn.Module, config, device: torch.device) -> nn.Mo
     try:
         compile_mode = str(config.compile_mode)
         compile_dynamic = bool(config.compile_dynamic)
+        cache_key = (compile_mode, compile_dynamic, device.type)
+        cache = getattr(model, "_aqi_compiled_cache", None)
+        if isinstance(cache, dict) and cache_key in cache:
+            return cast(nn.Module, cache[cache_key])
+
         compiled = torch.compile(model, mode=compile_mode, dynamic=compile_dynamic)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(model, "_aqi_compiled_cache", cache)
+        cache[cache_key] = compiled
         return cast(nn.Module, compiled)
     except Exception as exc:
         print(f"torch.compile unavailable, fallback to eager mode: {exc}")
