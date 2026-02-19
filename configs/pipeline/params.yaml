@@ -197,12 +197,14 @@ models:
 training:
   device: auto
   epochs: 80
-  batch_size: 256
+  # Server throughput profile (RTX 6000 class): start higher, reduce only if OOM.
+  batch_size: 4096
 
   early_stopping: true
   patience: 20
   min_delta: 0.0
-  log_every: 1
+  # Lower logging overhead during long runs.
+  log_every: 5
 
 paths:
   reports_dir: reports/forecast_experiments
