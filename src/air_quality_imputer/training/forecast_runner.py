@@ -1138,7 +1138,7 @@ def run(cfg: DictConfig) -> None:
                     avg_row: dict[str, float | int | str] = {
                         "approach": str(approach),
                         "model": str(model),
-                        "fold": int(fold),
+                        "fold": int(cast(Any, fold)),
                         "n_stations": int(sub["station"].astype(str).nunique()),
                         "n_eval_samples": int(pd.to_numeric(sub["n_eval_samples"], errors="coerce").fillna(0).sum()),
                         "train_time_sec": float("nan"),
