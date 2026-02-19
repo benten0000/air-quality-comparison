@@ -221,8 +221,8 @@ output:
 tracking:
   enabled: true
   # Speed mode defaults: avoid repeated heavy MLflow artifact/dataset logging in large 5-fold runs.
-  log_dataset_every_run: false
-  log_per_station_torch_models: false
+  log_dataset_every_run: true
+  log_per_station_torch_models: true
   experiment: air-quality-missing-data-imputation
   experiment_standard: comperosion-normal
   experiment_five_fold: comperosion-5fold
