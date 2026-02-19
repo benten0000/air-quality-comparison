@@ -50,6 +50,11 @@ RUNTIME_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _slug(value: str) -> str:
+    out = "".join(ch if ch.isalnum() else "_" for ch in str(value))
+    return out.strip("_").lower() or "na"
+
+
 def _lower_list(raw: Any, *, default: list[str]) -> list[str]:
     if raw is None:
         values = list(default)
@@ -493,6 +498,7 @@ def run_approach(
     training_cfg: DictConfig,
     fold_id: int,
     tracker: MLflowTracker | None = None,
+    model_artifact_path: str = "model",
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -596,7 +602,7 @@ def run_approach(
         val_station_geo=geo_val,
     )
     if tracker is not None:
-        tracker.log_torch_model(model, artifact_path="model")
+        tracker.log_torch_model(model, artifact_path=model_artifact_path)
 
     station_rows: list[dict[str, float | int | str]] = []
     all_true, all_pred = [], []
@@ -672,6 +678,7 @@ def run_approach_per_station(
     training_cfg: DictConfig,
     fold_id: int,
     tracker: MLflowTracker | None = None,
+    model_artifact_path_prefix: str = "model",
 ) -> tuple[dict[str, float | int | str], list[dict[str, float | int | str]]]:
     paths = cfg.paths
     features = list(cfg.data.features)
@@ -763,7 +770,7 @@ def run_approach_per_station(
             val_station_geo=geo_val,
         )
         if tracker is not None:
-            tracker.log_torch_model(model, artifact_path=f"model/{st}")
+            tracker.log_torch_model(model, artifact_path=f"{model_artifact_path_prefix}__{_slug(st)}")
 
         sid_test = np.zeros((len(splits["x_test"]),), dtype=np.int64)
         geo_test = np.repeat(station_geo_map[st][None, :], len(splits["x_test"]), axis=0).astype(np.float32, copy=False)
@@ -862,6 +869,14 @@ def run_scenario(
     for model_kind in model_kinds:
         for approach_kind in ("global", "per_station"):
             approach = f"{model_kind}__{approach_kind}"
+            model_display = (
+                f"{model_kind} | {approach_kind} | {scenario_name} | "
+                f"fold {int(fold_id):02d} | {source_name}"
+            )
+            model_artifact_path = (
+                f"model__{_slug(source_name)}__{_slug(scenario_name)}__"
+                f"fold{int(fold_id):02d}__{_slug(model_kind)}__{_slug(approach_kind)}"
+            )
             run_name = f"forecast-{source_name}-{scenario_name}-fold{int(fold_id):02d}-{approach}"
             with tracker.start_run(
                 run_name=run_name,
@@ -872,6 +887,8 @@ def run_scenario(
                     "model": model_kind,
                     "approach": approach_kind,
                     "fold": int(fold_id),
+                    "model_display": model_display,
+                    "training_type": approach_kind,
                 },
                 experiment_name=scenario_experiment,
             ):
@@ -970,9 +987,11 @@ def run_scenario(
                     },
                 )
                 model_manifest: dict[str, Any] = {
+                    "display_name": model_display,
                     "model_kind": str(model_kind),
                     "approach": str(approach),
                     "approach_kind": str(approach_kind),
+                    "artifact_path": model_artifact_path,
                     "runtime": to_plain_dict(model_runtime_cfg(cfg, model_kind)),
                     "params": to_plain_dict(cfg.models[model_kind].params),
                     "features": list(cfg.data.features),
@@ -982,8 +1001,11 @@ def run_scenario(
                 tracker.log_dict(model_manifest, artifact_file="model_manifest.json", artifact_path="model")
                 tracker.log_params(
                     {
+                        "display_name": model_display,
                         "kind": str(model_kind),
                         "approach": str(approach_kind),
+                        "training_type": str(approach_kind),
+                        "artifact_path": model_artifact_path,
                         "artifacts_saved": bool(cfg.output.save_models),
                     },
                     prefix="model",
@@ -1004,6 +1026,7 @@ def run_scenario(
                         training_cfg,
                         fold_id,
                         tracker=tracker,
+                        model_artifact_path=model_artifact_path,
                     )
                 else:
                     summary, rows = run_approach_per_station(
@@ -1019,6 +1042,7 @@ def run_scenario(
                         training_cfg,
                         fold_id,
                         tracker=tracker,
+                        model_artifact_path_prefix=model_artifact_path,
                     )
 
                 if bool(cfg.output.save_models):
