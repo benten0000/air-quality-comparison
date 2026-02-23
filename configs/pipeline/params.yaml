@@ -64,7 +64,7 @@ experiment:
     - hybrid_loclstm
 
   standard:
-    run: true
+    run: false
     # Share of full timeline used for validation.
     val_ratio: 0.1
     # Share of full timeline used for train.
